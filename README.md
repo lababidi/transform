@@ -1,4 +1,10 @@
-# TensorFlow Transform [![PyPI](https://img.shields.io/pypi/pyversions/tensorflow-transform.svg?style=plastic)](https://github.com/tensorflow/transform)
+<!-- See: www.tensorflow.org/tfx/transform/ -->
+
+# TensorFlow Transform
+
+[![Python](https://img.shields.io/pypi/pyversions/tensorflow-transform.svg?style=plastic)](https://github.com/tensorflow/transform)
+[![PyPI](https://badge.fury.io/py/tensorflow-transform.svg)](https://badge.fury.io/py/tensorflow-transform)
+[![Documentation](https://img.shields.io/badge/api-reference-blue.svg)](https://www.tensorflow.org/tfx/transform/api_docs/python/tft)
 
 *TensorFlow Transform* is a library for preprocessing data with TensorFlow.
 `tf.Transform` is useful for data that requires a full-pass, such as:
@@ -13,7 +19,7 @@ of examples. `tf.Transform` extends these capabilities to support full-passes
 over the example data.
 
 The output of `tf.Transform` is exported as a
-[TensorFlow graph](http://tensorflow.org/programmers_guide/graphs) to use for training and serving.
+[TensorFlow graph](http://tensorflow.org/guide/graphs) to use for training and serving.
 Using the same graph for both training and serving can prevent skew since the
 same transformations are applied in both stages.
 
@@ -53,10 +59,22 @@ other *untested* combinations may also work.
 
 |tensorflow-transform                                                            |tensorflow    |apache-beam[gcp]|
 |--------------------------------------------------------------------------------|--------------|----------------|
-|[GitHub master](https://github.com/tensorflow/transform/blob/master/RELEASE.md) |nightly (1.x) |2.4.0           |
+|[GitHub master](https://github.com/tensorflow/transform/blob/master/RELEASE.md) |nightly (1.x) |2.11.0          |
+|[0.13.0](https://github.com/tensorflow/transform/blob/v0.13.0/RELEASE.md)       |1.13          |2.11.0          |
+|[0.12.0](https://github.com/tensorflow/transform/blob/v0.12.0/RELEASE.md)       |1.12          |2.10.0          |
+|[0.11.0](https://github.com/tensorflow/transform/blob/v0.11.0/RELEASE.md)       |1.11          |2.8.0           |
+|[0.9.0](https://github.com/tensorflow/transform/blob/v0.9.0/RELEASE.md)         |1.9           |2.6.0           |
+|[0.8.0](https://github.com/tensorflow/transform/blob/v0.8.0/RELEASE.md)         |1.8           |2.5.0           |
 |[0.6.0](https://github.com/tensorflow/transform/blob/v0.6.0/RELEASE.md)         |1.6           |2.4.0           |
 |[0.5.0](https://github.com/tensorflow/transform/blob/v0.5.0/RELEASE.md)         |1.5           |2.3.0           |
 |[0.4.0](https://github.com/tensorflow/transform/blob/v0.4.0/RELEASE.md)         |1.4           |2.2.0           |
 |[0.3.1](https://github.com/tensorflow/transform/blob/v0.3.1/RELEASE.md)         |1.3           |2.1.1           |
 |[0.3.0](https://github.com/tensorflow/transform/blob/v0.3.0/RELEASE.md)         |1.3           |2.1.1           |
 |[0.1.10](https://github.com/tensorflow/transform/blob/v0.1.10/RELEASE.md)       |1.0           |2.0.0           |
+
+## Questions
+
+Please direct any questions about working with `tf.Transform` to
+[Stack Overflow](https://stackoverflow.com) using the
+[tensorflow-transform](https://stackoverflow.com/questions/tagged/tensorflow-transform)
+tag.

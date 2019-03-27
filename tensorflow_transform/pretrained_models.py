@@ -23,10 +23,11 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+# GOOGLE-INITIALIZATION
 
+import six
 import tensorflow as tf
 
-from tensorflow_transform import api
 from tensorflow.contrib.session_bundle import bundle_shim
 
 
@@ -81,7 +82,7 @@ def apply_saved_model(model_dir, inputs, tags, signature_name=None,
           'The SavedModel contains multiple signatures (%r) but signature_name '
           'was not specified.' % (meta_graph.signature_def.keys(),))
     else:
-      signature = meta_graph.signature_def.values()[0]
+      signature = next(six.itervalues(meta_graph.signature_def))
 
   # Generate mapping from tensors in the graph to the input tensors.
   if isinstance(inputs, dict):
@@ -97,7 +98,9 @@ def apply_saved_model(model_dir, inputs, tags, signature_name=None,
         'The SavedModel does not have exactly one input (had inputs %r) but '
         '`inputs` was not a dict.' % (signature.inputs.keys(),))
   else:
-    input_name_to_tensor_map = {signature.inputs.values()[0].name: inputs}
+    input_name_to_tensor_map = {
+        next(six.itervalues(signature.inputs)).name: inputs
+    }
 
   # Get output tensor names.
   if output_keys_in_signature:
@@ -117,7 +120,7 @@ def apply_saved_model(model_dir, inputs, tags, signature_name=None,
         'output_keys_in_signature was not specified.'
         % (signature.outputs.keys(),))
   else:
-    output_tensor_names = [signature.outputs.values()[0].name]
+    output_tensor_names = [next(six.itervalues(signature.outputs)).name]
     output_single_tensor = True
 
   # Convert_variables_to_constants() requires op name.
@@ -128,35 +131,23 @@ def apply_saved_model(model_dir, inputs, tags, signature_name=None,
       loaded_graph.as_graph_def(),
       output_op_names + loaded_initializer_op_names)
 
-  def import_graph_and_return_output_tensors():
-    """Imports the model's constant-converted GraphDef into the default graph.
+  returned_elements = tf.import_graph_def(
+      constant_graph_def,
+      input_map=input_name_to_tensor_map,
+      return_elements=output_tensor_names + loaded_initializer_op_names)
+  returned_output_tensors = returned_elements[:len(output_tensor_names)]
+  returned_initializer_ops = returned_elements[len(output_tensor_names):]
 
-    We must also copy the table initializers from the model's graph into the
-    composed graph. As a result, this function must be wrapped in
-    api.apply_function().
+  for initializer_op in returned_initializer_ops:
+    tf.add_to_collection(
+        tf.GraphKeys.TABLE_INITIALIZERS,
+        initializer_op)
 
-    Returns:
-      The model's output tensor(s).
-    """
-    returned_elements = tf.import_graph_def(
-        constant_graph_def,
-        input_map=input_name_to_tensor_map,
-        return_elements=output_tensor_names + loaded_initializer_op_names)
-    returned_output_tensors = returned_elements[:len(output_tensor_names)]
-    returned_initializer_ops = returned_elements[len(output_tensor_names):]
-
-    for initializer_op in returned_initializer_ops:
-      tf.add_to_collection(
-          tf.GraphKeys.TABLE_INITIALIZERS,
-          initializer_op)
-
-    if output_single_tensor:
-      assert len(output_tensor_names) == 1
-      return returned_output_tensors[0]
-    else:
-      return returned_output_tensors
-
-  return api.apply_function(import_graph_and_return_output_tensors)
+  if output_single_tensor:
+    assert len(output_tensor_names) == 1
+    return returned_output_tensors[0]
+  else:
+    return returned_output_tensors
 
 
 def apply_function_with_checkpoint(fn, inputs, checkpoint, include=None,
@@ -201,6 +192,7 @@ def apply_function_with_checkpoint(fn, inputs, checkpoint, include=None,
       output_tensors = output
       output_single_tensor = False
 
+    # TODO(qimingj/kestert): Copy table initializers to the composed graph.
     if tf.get_collection(tf.GraphKeys.TABLE_INITIALIZERS):
       raise ValueError('Models with table init ops are not supported.')
 

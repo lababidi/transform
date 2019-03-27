@@ -61,17 +61,24 @@ entrypoints into our code where this happens and creating a
 1) In AnalyzeDatset.expand() which is typically called from the main thread
 2) In _GraphState.__init__ which is called from the worker running
    _RunMetaGraphDoFn
-3) In replace_tensors_with_constant_values, which is called in a beam.Map.
+3) In _replace_tensors_with_constant_values, which is called in a beam.Map.
 4) In extract_scalar_constants, which is called in a beam.Map.
 """
+# TODO(KesterTong): Document data format.
+# TODO(KesterTong): Refactor and rename now that "TransformFn" is the path to a
+# SavedModel, not an in-memory object.
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 
 import collections
 import copy
 import datetime
 import os
 import threading
-import uuid
 
+# GOOGLE-INITIALIZATION
 
 import apache_beam as beam
 
@@ -86,27 +93,43 @@ from apache_beam.typehints import with_output_types
 import numpy as np
 import six
 import tensorflow as tf
-from tensorflow_transform import analyzers as tft_analyzers
-from tensorflow_transform import api as tft_api
 from tensorflow_transform import impl_helper
-from tensorflow_transform.beam import analyzer_impls
+from tensorflow_transform import nodes
+from tensorflow_transform import schema_inference
+from tensorflow_transform.beam import analysis_graph_builder
+from tensorflow_transform.beam import analyzer_cache
+from tensorflow_transform.beam import beam_nodes
 from tensorflow_transform.beam import common
+from tensorflow_transform.beam import deep_copy
 from tensorflow_transform.beam import shared
 from tensorflow_transform.beam.tft_beam_io import beam_metadata_io
 from tensorflow_transform.saved import saved_transform_io
 from tensorflow_transform.tf_metadata import dataset_metadata
 from tensorflow_transform.tf_metadata import dataset_schema
 
-_DATASET_ELEMENT_TYPE = Dict[str, Union[common.PRIMITIVE_TYPE,
-                                        # Arbitrarily-nested lists are allowed.
-                                        List[Any], np.generic, np.ndarray]]
+# TODO(b/123325923): Fix the key type here to agree with the actual keys.
+_DATASET_ELEMENT_TYPE = Dict[Any,  # Any -> six.text_type?
+                             Union[common.PRIMITIVE_TYPE,
+                                   # Arbitrarily-nested lists are allowed.
+                                   List[Any], np.generic, np.ndarray]]
+
+# TODO(b/68154497): pylint: disable=no-value-for-parameter
 
 
-
+# TODO(b/64956765): Remove this once either the keepalive issue (b/30837990), or
+# the mentioned bug above is resolved.
+# TODO(zoyahav): Make this a PTransform.
 def _clear_shared_state_after_barrier(pipeline, input_barrier):
   """Clears any shared state from within a pipeline context.
 
   This will only be cleared once input_barrier becomes available.
+
+  Args:
+    pipeline: A `beam.Pipeline` object.
+    input_barrier: A `PCollection` which the pipeline should wait for.
+
+  Returns:
+    An empty `PCollection`.
   """
   empty_pcoll = input_barrier | 'MakeCheapBarrier' >> beam.FlatMap(
       lambda x: None)
@@ -138,12 +161,14 @@ class Context(object):
   permissions that allow both launcher and workers to access it.
   """
 
-  _State = collections.namedtuple(  # pylint: disable=invalid-name
-      '_State', [
+  class _State(
+      collections.namedtuple('_State', [
           'temp_dir',
           'desired_batch_size',
           'passthrough_keys',
-      ])
+          'use_deep_copy_optimization',
+      ])):
+    pass
 
   class _StateStack(object):
     """Stack of states for this context manager (found in thread-local storage).
@@ -152,6 +177,8 @@ class Context(object):
     def __init__(self):
       self.frames = []
 
+  # TODO(b/36359436) Ensure tf.Transform code only uses consistent filesystem
+  # operations on Cloud.
   _TEMP_SUBDIR = 'tftransform_tmp'
 
   _thread_local = threading.local()
@@ -159,15 +186,18 @@ class Context(object):
   def __init__(self,
                temp_dir=None,
                desired_batch_size=None,
-               passthrough_keys=None):
+               passthrough_keys=None,
+               use_deep_copy_optimization=None):
     state = getattr(self._thread_local, 'state', None)
     if not state:
       self._thread_local.state = self._StateStack()
-      self._thread_local.state.frames.append(self._State(None, None, None))
+      self._thread_local.state.frames.append(
+          self._State(*(None,) * len(self._State._fields)))
 
     self._temp_dir = temp_dir
     self._desired_batch_size = desired_batch_size
     self._passthrough_keys = passthrough_keys
+    self._use_deep_copy_optimization = use_deep_copy_optimization
 
   def __enter__(self):
     # Previous State's properties are inherited if not explicitly specified.
@@ -179,9 +209,12 @@ class Context(object):
             desired_batch_size=self._desired_batch_size
             if self._desired_batch_size is not None else
             last_frame.desired_batch_size,
-            passthrough_keys=self._passthrough_keys
-            if self._passthrough_keys is not None else
-            last_frame.passthrough_keys))
+            passthrough_keys=self._passthrough_keys if
+            self._passthrough_keys is not None else last_frame.passthrough_keys,
+            use_deep_copy_optimization=self._use_deep_copy_optimization
+            if self._use_deep_copy_optimization is not None else
+            last_frame.use_deep_copy_optimization,
+        ))
 
   def __exit__(self, *exn_info):
     self._thread_local.state.frames.pop()
@@ -203,6 +236,7 @@ class Context(object):
           'manager.')
     base_temp_dir = os.path.join(state.temp_dir, cls._TEMP_SUBDIR)
 
+    # TODO(b/35363519): Perhaps use Beam IO eventually?
     tf.gfile.MakeDirs(base_temp_dir)
     return base_temp_dir
 
@@ -211,7 +245,7 @@ class Context(object):
     """Retrieves a user set fixed batch size, None if not set."""
     state = cls._get_topmost_state_frame()
     if state is not None and state.desired_batch_size is not None:
-      tf.logging.info('Using fixed batch size: %d' % state.desired_batch_size)
+      tf.logging.info('Using fixed batch size: %d', state.desired_batch_size)
       return state.desired_batch_size
     return None
 
@@ -222,6 +256,14 @@ class Context(object):
     if state is not None and state.passthrough_keys is not None:
       return state.passthrough_keys
     return set()
+
+  @classmethod
+  def get_use_deep_copy_optimization(cls):
+    """Retrieves a user set use_deep_copy_optimization, None if not set."""
+    state = cls._get_topmost_state_frame()
+    if state is not None and state.use_deep_copy_optimization is not None:
+      return state.use_deep_copy_optimization
+    return False
 
 
 @beam.ptransform_fn
@@ -236,6 +278,7 @@ def _BatchElements(pcoll):  # pylint: disable=invalid-name
   return pcoll | 'BatchElements' >> util.BatchElements(**kwargs)
 
 
+# TODO(b/36223892): Verify that these type hints work and make needed fixes.
 @with_input_types(List[_DATASET_ELEMENT_TYPE], str)
 @with_output_types(Dict[str, Union[np.ndarray, tf.SparseTensorValue]])
 class _RunMetaGraphDoFn(beam.DoFn):
@@ -259,33 +302,41 @@ class _RunMetaGraphDoFn(beam.DoFn):
 
   # Thread-safe.
   class _GraphState(object):
+    """A container for a shared graph state."""
 
     def __init__(self, saved_model_dir, input_schema, exclude_outputs,
                  tf_config):
       self.saved_model_dir = saved_model_dir
       graph = tf.Graph()
-      self.session = tf.Session(graph=graph, config=tf_config)
+      self._session = tf.Session(graph=graph, config=tf_config)
       with graph.as_default():
-        with self.session.as_default():
+        with self._session.as_default():
           inputs, outputs = (
               saved_transform_io.partially_apply_saved_transform_internal(
                   saved_model_dir, {}))
-        self.session.run(tf.global_variables_initializer())
-        self.session.run(tf.tables_initializer())
+        self._session.run(tf.global_variables_initializer())
+        self._session.run(tf.tables_initializer())
+        graph.finalize()
 
-        input_schema_keys = input_schema.column_schemas.keys()
-        extra_input_keys = set(input_schema_keys).difference(inputs.keys())
-        if extra_input_keys:
+        input_schema_keys = input_schema.as_feature_spec().keys()
+        if set(input_schema_keys).difference(inputs.keys()):
           raise ValueError('Input schema contained keys not in graph: %s' %
                            input_schema_keys)
-        extra_output_keys = set(exclude_outputs).difference(outputs.keys())
-        if extra_output_keys:
+        if set(exclude_outputs).difference(outputs.keys()):
           raise ValueError('Excluded outputs contained keys not in graph: %s' %
                            exclude_outputs)
-        non_excluded_output_keys = set(
-            outputs.keys()).difference(exclude_outputs)
-        self.inputs = {key: inputs[key] for key in input_schema_keys}
-        self.outputs = {key: outputs[key] for key in non_excluded_output_keys}
+        non_excluded_output_keys = sorted(
+            set(outputs.keys()).difference(exclude_outputs))
+        fetches = [outputs[key] for key in non_excluded_output_keys]
+        tensor_inputs = impl_helper.filter_input_tensors(inputs, fetches)
+        self.inputs_tensor_keys = sorted(tensor_inputs.keys())
+        self.outputs_tensor_keys = non_excluded_output_keys
+
+        tensor_inputs_list = [
+            tensor_inputs[key] for key in self.inputs_tensor_keys
+        ]
+        self.callable_get_outputs = self._session.make_callable(
+            fetches, feed_list=tensor_inputs_list)
 
   def __init__(self,
                input_schema,
@@ -299,7 +350,7 @@ class _RunMetaGraphDoFn(beam.DoFn):
         exclude_outputs if exclude_outputs is not None else [])
     self._serialized_tf_config = serialized_tf_config
     self._passthrough_keys = set(passthrough_keys)
-    schema_keys = set(input_schema.column_schemas.keys())
+    schema_keys = set(input_schema.as_feature_spec().keys())
     if self._passthrough_keys - schema_keys != self._passthrough_keys:
       raise ValueError(
           'passthrough_keys overlap with schema keys: {}, {}'.format(
@@ -332,16 +383,21 @@ class _RunMetaGraphDoFn(beam.DoFn):
              ] for key in self._passthrough_keys
     }
 
-    feed_dict = impl_helper.make_feed_dict(self._graph_state.inputs,
+    feed_list = impl_helper.make_feed_list(self._graph_state.inputs_tensor_keys,
                                            self._input_schema, batch)
 
     try:
-      result = self._graph_state.session.run(
-          self._graph_state.outputs, feed_dict=feed_dict)
+      outputs_list = self._graph_state.callable_get_outputs(*feed_list)
     except Exception as e:
-      tf.logging.error('%s while applying transform function for tensors %s' %
-                       (e, self._graph_state.outputs))
-      raise
+      tf.logging.error('%s while applying transform function for tensors %s',
+                       e, self._graph_state.outputs_tensor_keys)
+      raise ValueError('bad inputs: {}'.format(feed_list))
+
+    assert len(self._graph_state.outputs_tensor_keys) == len(outputs_list)
+    result = {
+        key: value for key, value in zip(self._graph_state.outputs_tensor_keys,
+                                         outputs_list)
+    }
 
     for key, value in six.iteritems(passthrough_data):
       result[key] = value
@@ -389,40 +445,11 @@ class _RunMetaGraphDoFn(beam.DoFn):
 def _assert_tensorflow_version():
   # Fail with a clear error in case we are not using a compatible TF version.
   major, minor, _ = tf.__version__.split('.')
-  if int(major) != 1 or int(minor) < 6:
+  if int(major) != 1 or int(minor) < 13:
     raise RuntimeError(
-        'TensorFlow version >= 1.6, < 2 is required. Found (%s). Please '
+        'TensorFlow version >= 1.13, < 2 is required. Found (%s). Please '
         'install the latest 1.x version from '
         'https://github.com/tensorflow/tensorflow. ' % tf.__version__)
-
-
-def _make_unique_temp_dir(base_temp_dir):
-  """Create path to a unique temp dir from given base temp dir."""
-  return os.path.join(base_temp_dir, uuid.uuid4().hex)
-
-
-def _write_saved_transform(graph, inputs, outputs, saved_model_dir):
-  """Write the given function as a saved transform."""
-  with tf.Session(graph=graph) as session:
-    # Remove collections that can't be serialized, as these produce annoying
-    # warnings.
-    # pylint: disable=protected-access
-    collections_blacklist = [
-        tft_api.FUNCTION_APPLICATION_COLLECTION,
-        tft_analyzers.ANALYZER_COLLECTION
-    ]
-    # pylint: enable=protected-access
-    removed_collections = []
-    for collection_name in collections_blacklist:
-      removed_collections.append((collection_name,
-                                  graph.get_collection(collection_name)))
-      graph.clear_collection(collection_name)
-    # Initialize all variables so they can be saved.
-    session.run(tf.global_variables_initializer())
-    saved_transform_io.write_saved_transform_from_session(
-        session, inputs, outputs, saved_model_dir)
-    for collection_name, collection in removed_collections:
-      graph.get_collection_ref(collection_name).extend(collection)
 
 
 def _convert_and_unbatch_to_instance_dicts(batch_dict, schema,
@@ -453,257 +480,197 @@ def _convert_and_unbatch_to_instance_dicts(batch_dict, schema,
   return result
 
 
-# An object used to construct a constant tensor in the graph, that will replace
-# a placeholder tensor.  `value` is a numpy array.  `is_asset_filename` is set
-# to true when the tensor contains an asset filename.  This information is
-# needed as asset filenames must get added to a special collection when they
-# are inserted into the graph, so that their names get updated when the
-# SavedModel is copied.
-_TensorValue = collections.namedtuple('_TensorValue',
-                                      ['value', 'is_asset_filename'])
+_TensorBinding = collections.namedtuple(
+    '_TensorBinding', ['value', 'tensor_name', 'is_asset_filepath'])
 
 
-class _ReplaceTensorsWithConstants(beam.PTransform):
-  """Writes a SavedModel with specified tensors replaced by constants.
+@common.register_ptransform(beam_nodes.CreateTensorBinding)
+def _create_tensor_bindings_impl(inputs, operation, extra_args):
+  del extra_args  # unused
+  return inputs[0] | operation.label >> beam.Map(
+      _TensorBinding, operation.tensor, operation.is_asset_filepath)
 
-  This transform takes a SavedModel in its constructor, and in its expand()
-  method accepts a mapping from tensors to PCollections.  When run, it replaces
-  the tensors corresponding to the keys of this mapping, with the values
-  wrapped in the PCollections.
+
+def _replace_tensors_with_constant_values(saved_model_dir, tensor_bindings,
+                                          base_temp_dir):
+  """Replaces specified `Tensor`s with constant values.
+
+  Constants are accepted as Python values; these are automatically
+  wrapped in `tf.constant()`.
+
+  This method creates its own temp dir, and is therefore idempotent
+  since any retry will use a different temp dir.
 
   Args:
-    saved_model_dir: The directory containing the SavedModel.
-  """
+    saved_model_dir: A SavedModel directory providing a transform
+      graph.  The MetaGraphDef and signature are selected from the
+      SavedModel using keys defined in `../constants.py` ('transform'
+      and 'transform_signature', respectively).
+    tensor_bindings: An iterable of `_TensorBinding`s.
+    base_temp_dir: Base temp dir for storage of new model.
 
-  def __init__(self, saved_model_dir, base_temp_dir, pipeline):
-    self._saved_model_dir = saved_model_dir
+  Returns:
+    The directory name containing the updated SavedModel.
+
+    Raises:
+      RuntimeError: if there is no default graph available to which to
+        apply the transform.
+  """
+  with tf.Graph().as_default() as graph:
+    tensor_replacement_map = {}
+    for value, tensor_name, is_asset_filepath in tensor_bindings:
+      replacement_tensor = tf.constant(value)
+      if is_asset_filepath:
+        graph.add_to_collection(tf.GraphKeys.ASSET_FILEPATHS,
+                                replacement_tensor)
+      tensor_replacement_map[tensor_name] = replacement_tensor
+
+    with tf.Session(graph=graph) as session:
+      temp_dir = common.get_unique_temp_path(base_temp_dir)
+      input_tensors, output_tensors = (
+          saved_transform_io.partially_apply_saved_transform_internal(
+              saved_model_dir, {}, tensor_replacement_map))
+      session.run(tf.global_variables_initializer())
+      saved_transform_io.write_saved_transform_from_session(
+          session, input_tensors, output_tensors, temp_dir)
+    return temp_dir
+
+
+@common.register_ptransform(beam_nodes.CreateSavedModel)
+def _create_saved_model_impl(inputs, operation, extra_args):
+  """Create a SavedModel from a TF Graph."""
+  unbound_saved_model_dir = common.get_unique_temp_path(
+      extra_args.base_temp_dir)
+  with extra_args.graph.as_default():
+    with tf.Session(graph=extra_args.graph) as session:
+      table_initializers_ref = tf.get_collection_ref(
+          tf.GraphKeys.TABLE_INITIALIZERS)
+      original_table_initializers = list(table_initializers_ref)
+      del table_initializers_ref[:]
+      table_initializers_ref.extend(operation.table_initializers)
+      # Initialize all variables so they can be saved.
+      session.run(tf.global_variables_initializer())
+      saved_transform_io.write_saved_transform_from_session(
+          session, extra_args.input_signature, operation.output_signature,
+          unbound_saved_model_dir)
+      del table_initializers_ref[:]
+      table_initializers_ref.extend(original_table_initializers)
+  return inputs | operation.label >> _BindTensors(
+      extra_args.base_temp_dir, unbound_saved_model_dir, extra_args.pipeline)
+
+
+class _BindTensors(beam.PTransform):
+  """PTransform to bind tensor in a SavedModel."""
+
+  def __init__(self, base_temp_dir, unbound_saved_model_dir, pipeline):
     self._base_temp_dir = base_temp_dir
-    # Generally the pipeline is inferred from its inputs, however we need
-    # to know the pipeline for beam.Create.
+    self._unbound_saved_model_dir = unbound_saved_model_dir
     self.pipeline = pipeline
 
-  def expand(self, tensor_pcoll_mapping):
-    """Converts a dict of statistics to a transform function.
+  def expand(self, inputs):
+    saved_model_dir_pcoll = self.pipeline | 'CreateSavedModel' >> beam.Create(
+        [self._unbound_saved_model_dir])
 
-    Args:
-      tensor_pcoll_mapping: A dictionary mapping `Tensor`s to a singleton
-          PCollection containing a _TensorValue.
+    if not inputs:
+      return saved_model_dir_pcoll
 
-    Returns:
-      A single-element PCollection containing the directory name with the
-          SavedModel.
-    """
-    transform_fn = (
-        self.pipeline
-        | 'CreateTransformFn' >> beam.Create([self._saved_model_dir]))
-
-    if not tensor_pcoll_mapping:
-      return transform_fn
-
-    # Convert tensor_value_mapping into a DictPCollectionView so it can be
-    # passed as a side input to the beam Map below.
-    tensor_value_pairs = []
-    for name, pcoll in six.iteritems(tensor_pcoll_mapping):
-      tensor_value_pairs.append(
-          pcoll
-          | 'AddName[%s]' % name >> beam.Map(lambda x, name=name: (name, x)))
-    tensor_value_mapping = beam.pvalue.AsDict(
-        tensor_value_pairs | 'MergeTensorValuePairs' >> beam.Flatten())
-
-    def replace_tensors_with_constant_values(saved_model_dir,
-                                             tensor_value_mapping):
-      """Replaces specified `Tensor`s with constant values.
-
-      Constants are accepted as Python values; these are automatically
-      wrapped in `tf.constant()`.
-
-      This method creates its own temp dir, and is therefore idempotent
-      since any retry will use a different temp dir.
-
-      Args:
-        saved_model_dir: A SavedModel directory providing a transform
-          graph.  The MetaGraphDef and signature are selected from the
-          SavedModel using keys defined in `../constants.py` ('transform'
-          and 'transform_signature', respectively).
-        tensor_value_mapping: a dict of tensor names to values to use in
-          place of those tensors.
-
-      Returns:
-        The directory name containing the updated SavedModel.
-
-      Raises:
-        RuntimeError: if there is no default graph available to which to
-          apply the transform.
-      """
-
-      graph = tf.Graph()
-      with graph.as_default():
-        tensor_replacement_map = {}
-        for orig_tensor_name, (value,
-                               is_asset) in six.iteritems(tensor_value_mapping):
-          new_tensor = tf.constant(value)
-          if is_asset:
-            # Any newly frozen constant tensors containing filenames must be
-            # added to the ASSET_FILENAMES collection.
-            graph.add_to_collection(tf.GraphKeys.ASSET_FILEPATHS, new_tensor)
-          tensor_replacement_map[orig_tensor_name] = new_tensor
-
-        with tf.Session(graph=graph) as session:
-          temp_dir = _make_unique_temp_dir(self._base_temp_dir)
-          input_tensors, output_tensors = (
-              saved_transform_io.partially_apply_saved_transform_internal(
-                  saved_model_dir, {}, tensor_replacement_map))
-          session.run(tf.global_variables_initializer())
-          saved_transform_io.write_saved_transform_from_session(
-              session, input_tensors, output_tensors, temp_dir)
-        return temp_dir
-
-    return (transform_fn | 'ReplaceTensorsWithConstantValues' >> beam.Map(
-        replace_tensors_with_constant_values,
-        tensor_value_mapping=tensor_value_mapping))
+    flattened_tensor_bindings = (
+        inputs | 'Flatten' >> beam.Flatten(pipeline=self.pipeline))
+    return saved_model_dir_pcoll | 'BindTensors' >> beam.Map(
+        _replace_tensors_with_constant_values,
+        tensor_bindings=beam.pvalue.AsIter(flattened_tensor_bindings),
+        base_temp_dir=self._base_temp_dir)
 
 
-class _RunPhase(beam.PTransform):
-  """Run analyzers for a phase and return an update to tensor_pcoll_mapping."""
+@common.register_ptransform(beam_nodes.ApplySavedModel)
+class _ApplySavedModelImpl(beam.PTransform):
+  """PTransform to apply a SavedModel to data."""
 
-  def __init__(self, analyzer_infos, unbound_saved_model_dir, base_temp_dir,
-               input_schema, serialized_tf_config):
-    self._analyzer_infos = analyzer_infos
-    self._unbound_saved_model_dir = unbound_saved_model_dir
-    self._base_temp_dir = base_temp_dir
-    self._input_schema = input_schema
-    self._serialized_tf_config = serialized_tf_config
+  def __init__(self, operation, extra_args):
+    self._input_schema = extra_args.input_schema
+    self._serialized_tf_config = extra_args.serialized_tf_config
+    self._phase = operation.phase
+    if operation.dataset_key is None:
+      self._input_values_pcoll = extra_args.flat_pcollection
+    else:
+      self._input_values_pcoll = extra_args.pcollection_dict[
+          operation.dataset_key]
 
   def expand(self, inputs):
-    input_values, tensor_pcoll_mapping = inputs
 
-    saved_model_dir = (
-        tensor_pcoll_mapping
-        | 'CreateSavedModelForAnalyzerInputs' >> _ReplaceTensorsWithConstants(
-            self._unbound_saved_model_dir, self._base_temp_dir,
-            input_values.pipeline))
+    # We don't deep_copy pcollections used for the first phase, or when
+    # the user defined `Context` disables it.
+    if self._phase > 0 and Context.get_use_deep_copy_optimization():
+      # Obviates unnecessary data materialization when the input data source is
+      # safe to read more than once.
+      tf.logging.info('Deep copying inputs for phase: %d', self._phase)
+      input_values = deep_copy.deep_copy(self._input_values_pcoll)
+    else:
+      input_values = self._input_values_pcoll
 
-    # Run this saved model on the input dataset to obtain the inputs to the
-    # analyzers.
-    analyzer_input_values = (
+    return (
         input_values
-        | 'BatchAnalyzerInputs' >> _BatchElements()
-        | 'ComputeAnalyzerInputs' >> beam.ParDo(
+        | 'BatchInputs' >> _BatchElements()
+        | 'ApplySavedModel' >> beam.ParDo(
             _RunMetaGraphDoFn(
                 self._input_schema,
                 self._serialized_tf_config,
                 shared_graph_state_handle=shared.Shared(),
                 passthrough_keys=Context.get_passthrough_keys()),
-            saved_model_dir=beam.pvalue.AsSingleton(saved_model_dir)))
-
-    # For each analyzer output, look up its input values (by tensor name)
-    # and run the analyzer on these values.
-    result = {}
-    for analyzer_info in self._analyzer_infos:
-      temp_assets_dir = _make_unique_temp_dir(self._base_temp_dir)
-      tf.gfile.MkDir(temp_assets_dir)
-      output_pcolls = (
-          analyzer_input_values
-          | 'ExtractInputs[%s]' % analyzer_info.name >> beam.Map(
-              lambda batch, keys: [batch[key] for key in keys],
-              keys=analyzer_info.input_tensor_names)
-          | 'Analyze[%s]' % analyzer_info.name >> analyzer_impls._AnalyzerImpl(
-              analyzer_info.spec, temp_assets_dir))
-      # pylint: enable=protected-access
-
-      if len(output_pcolls) != len(analyzer_info.output_infos):
-        raise ValueError(
-            'Analyzer {} has {} outputs but its implementation produced {} '
-            'pcollections'.format(
-                analyzer_info.name, len(analyzer_info.output_infos),
-                len(output_pcolls)))
-
-      for index, (output_pcoll, (name, is_asset)) in enumerate(zip(
-          output_pcolls, analyzer_info.output_infos)):
-        result[name] = (
-            output_pcoll
-            | 'WrapAsTensorValue[%s][%d]' % (analyzer_info.name, index)
-            >> beam.Map(_TensorValue, is_asset))
-    return result
+            saved_model_dir=beam.pvalue.AsSingleton(inputs[0])))
 
 
-def _augment_metadata(saved_model_dir, metadata):
-  """Augments the metadata with min/max values stored in the SavedModel.
+@common.register_ptransform(beam_nodes.ExtractFromDict)
+def _extract_from_dict_impl(inputs, operation, extra_args):
+  del extra_args  # unused
+  return inputs[0] | operation.label >> beam.Map(
+      lambda d, keys=operation.keys: tuple(d[key] for key in keys))
 
-  Takes the min/max values of tensors stored in the SavedModel, and uses these
-  to augment the metadata.  For each feature in the metadata, the min/max of
-  the corresponding `Tensor` are used to augment the schema.  For a feature
-  represented by a `SparseTensor` we use the min/max for the `values` field of
-  the `SparseTensor`.
 
-  Args:
-    saved_model_dir: Location of a SavedModel
-    metadata: A `DatasetMetadata`
+@common.register_ptransform(beam_nodes.Flatten)
+class _Flatten(beam.PTransform):
+  """PTransform to flatten PCollections."""
 
-  Returns:
-    An augmented DatasetMetadata.  The original DatasetMetadata is unchanged.
-  """
+  def __init__(self, operation, extra_args):
+    del extra_args  # unused
+    self._label = operation.label
+
+  def default_label(self):
+    return self._label
+
+  def expand(self, inputs):
+    return inputs | beam.Flatten()
+
+
+def _infer_metadata_from_saved_model(saved_model_dir):
+  """Infers a DatasetMetadata for outputs of a SavedModel."""
   with tf.Graph().as_default() as graph:
     with tf.Session(graph=graph) as session:
-      _, output_tensor_by_name = (
+      _, outputs = (
           saved_transform_io.partially_apply_saved_transform_internal(
               saved_model_dir, {}))
 
-      # Get overrides for the min/max of tensors from the graph, and use these
-      # determine overrides for the min/max of the outputs of the graph.
-      tensor_schema_overrides = tft_api.get_tensor_schema_overrides()
-      column_schema_overrides = {}
-      for name, tensor in six.iteritems(output_tensor_by_name):
-        if isinstance(tensor, tf.SparseTensor):
-          tensor = tensor.values
-        if tensor in tensor_schema_overrides:
-          column_schema_overrides[name] = tensor_schema_overrides[tensor]
-
       session.run(tf.global_variables_initializer())
       session.run(tf.tables_initializer())
-      column_schema_override_values = session.run(column_schema_overrides)
-
-  new_column_schemas = {}
-  for key, column_schema in six.iteritems(metadata.schema.column_schemas):
-    if key in column_schema_override_values:
-      min_value, max_value = column_schema_override_values[key]
-      assert column_schema.domain.dtype == tf.int64
-      assert isinstance(column_schema.domain, dataset_schema.IntDomain)
-      # Create a new column schema.  An override always results in a
-      # categorical column.
-      new_column_schemas[key] = dataset_schema.ColumnSchema(
-          dataset_schema.IntDomain(tf.int64, min_value, max_value,
-                                   is_categorical=True),
-          column_schema.axes,
-          column_schema.representation)
-    else:
-      new_column_schemas[key] = column_schema
-
-  return dataset_metadata.DatasetMetadata(dataset_schema.Schema(
-      new_column_schemas))
+      return dataset_metadata.DatasetMetadata(
+          schema=schema_inference.infer_feature_schema(outputs, graph, session))
 
 
-class AnalyzeDataset(beam.PTransform):
-  """Takes a preprocessing_fn and computes the relevant statistics.
-
-  AnalyzeDataset accepts a preprocessing_fn in its constructor.  When its
-  `expand` method is called on a dataset, it computes all the relevant
-  statistics required to run the transformation described by the
-  preprocessing_fn, and returns a TransformFn representing the application of
-  the preprocessing_fn.
-
-  Args:
-    preprocessing_fn: A function that accepts and returns a dictionary from
-      strings to `Tensor` or `SparseTensor`s.
-  """
+class _AnalyzeDatasetCommon(beam.PTransform):
+  """Common implementation for AnalyzeDataset, with or without cache."""
 
   def __init__(self, preprocessing_fn):
     self._preprocessing_fn = preprocessing_fn
     _assert_tensorflow_version()
 
   def _extract_input_pvalues(self, dataset):
-    data, metadata = dataset
-    pvalues = [data]
+    # This method returns all nested pvalues to inform beam of nested pvalues.
+    flat_data, data_dict, dataset_cache_dict, metadata = dataset
+    pvalues = [flat_data] + [data_dict[k] for k in data_dict]
+    if dataset_cache_dict is not None:
+      for cache_dict in dataset_cache_dict.values():
+        for cache_pcoll in cache_dict.values():
+          pvalues.append(cache_pcoll)
     if isinstance(metadata, beam_metadata_io.BeamDatasetMetadata):
       pvalues.append(metadata.deferred_metadata)
     return dataset, pvalues
@@ -720,108 +687,148 @@ class AnalyzeDataset(beam.PTransform):
     Raises:
       ValueError: If preprocessing_fn has no outputs.
     """
-    input_values, input_metadata = dataset
+    (flattened_pcoll, input_values_pcoll_dict, dataset_cache_dict,
+     input_metadata) = dataset
     input_schema = input_metadata.schema
 
-    base_temp_dir = Context.create_base_temp_dir()
+    input_values_pcoll_dict = input_values_pcoll_dict or dict()
 
-    graph = tf.Graph()
-    with graph.as_default():
+    analyzer_cache.validate_dataset_keys(input_values_pcoll_dict.keys())
+
+    with tf.Graph().as_default() as graph:
 
       with tf.name_scope('inputs'):
-        inputs = input_schema.as_batched_placeholders()
-      # In order to avoid a bug where import_graph_def fails when the input_map
-      # and return_elements of an imported graph are the same (b/34288791), we
-      # avoid using the placeholder of an input column as an output of a graph.
-      # We do this by applying tf.identity to all inputs of the
-      # preprocessing_fn.  Note this applies at the level of raw tensors.
-      outputs = self._preprocessing_fn(impl_helper.copy_tensors(inputs))
+        feature_spec = input_schema.as_feature_spec()
+        input_signature = impl_helper.feature_spec_as_batched_placeholders(
+            feature_spec)
+        # In order to avoid a bug where import_graph_def fails when the
+        # input_map and return_elements of an imported graph are the same
+        # (b/34288791), we avoid using the placeholder of an input column as an
+        # output of a graph. We do this by applying tf.identity to all inputs of
+        # the preprocessing_fn.  Note this applies at the level of raw tensors.
+        # TODO(b/34288791): Remove this workaround and use a shallow copy of
+        # inputs instead.  A shallow copy is needed in case
+        # self._preprocessing_fn mutates its input.
+        copied_inputs = impl_helper.copy_tensors(input_signature)
 
-      # At this point we check that the preprocessing_fn has at least one
-      # output. This is because if we allowed the output of preprocessing_fn to
-      # be empty, we wouldn't be able to determine how many instances to
-      # "unbatch" the output into.
-      if not outputs:
-        raise ValueError('The preprocessing function returned an empty dict')
+      output_signature = self._preprocessing_fn(copied_inputs)
 
-      if graph.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES):
-        raise ValueError(
-            'The preprocessing function contained trainable variables '
-            '{}'.format(
-                graph.get_collection_ref(tf.GraphKeys.TRAINABLE_VARIABLES)))
+    # At this point we check that the preprocessing_fn has at least one
+    # output. This is because if we allowed the output of preprocessing_fn to
+    # be empty, we wouldn't be able to determine how many instances to
+    # "unbatch" the output into.
+    if not output_signature:
+      raise ValueError('The preprocessing function returned an empty dict')
 
-      # NOTE: it's important that create_phases is called directly after
-      # preprocessing_fn, because we later mutate the graph's TABLE_INITIALIZERS
-      # collection which would break the logic in create_phases.
-      phases = impl_helper.create_phases()
+    if graph.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES):
+      raise ValueError(
+          'The preprocessing function contained trainable variables '
+          '{}'.format(
+              graph.get_collection_ref(tf.GraphKeys.TRAINABLE_VARIABLES)))
 
-      # Iterate through levels.  tensor_pcoll_mapping is a mapping from tensor
-      # names to singleton PCollections containing a _TensorValue.  We compute
-      # tensor_pcoll_mapping in phases, where at each phase we compute the
-      # analyzers that are ready to run and update tensor_pcoll_mapping.
-      tensor_pcoll_mapping = {}
-      table_initializers = graph.get_collection_ref(
-          tf.GraphKeys.TABLE_INITIALIZERS)
-      original_table_initializers = list(table_initializers)
-      del table_initializers[:]
+    pipeline = flattened_pcoll.pipeline
+    serialized_tf_config = common._DEFAULT_TENSORFLOW_CONFIG_BY_RUNNER.get(  # pylint: disable=protected-access
+        pipeline.runner)
+    extra_args = common.ConstructBeamPipelineVisitor.ExtraArgs(
+        base_temp_dir=Context.create_base_temp_dir(),
+        serialized_tf_config=serialized_tf_config,
+        pipeline=pipeline,
+        flat_pcollection=flattened_pcoll,
+        pcollection_dict=input_values_pcoll_dict,
+        graph=graph,
+        input_signature=input_signature,
+        input_schema=input_schema,
+        cache_pcoll_dict=dataset_cache_dict)
 
-      serialized_tf_config = (
-          common._DEFAULT_TENSORFLOW_CONFIG_BY_RUNNER.get(  # pylint: disable=protected-access
-              input_values.pipeline.runner))
-      for level, phase in enumerate(phases):
-        # Create a SavedModel that describes the mapping from the input data
-        # to the inputs of the analyzers at this level.  The colum names of the
-        # outputs are the tensor names of the analyzer inputs in the graph.
-        # This graph has the anaylzer outputs computed so far replaced with
-        # constants.
-        analyzer_inputs = {}
-        for analyzer in phase.analyzer_infos:
-          for input_tensor_name in analyzer.input_tensor_names:
-            analyzer_inputs[input_tensor_name] = graph.get_tensor_by_name(
-                input_tensor_name)
-        table_initializers.extend(phase.table_initializers)
-        unbound_saved_model_dir = _make_unique_temp_dir(base_temp_dir)
-        _write_saved_transform(graph, inputs, analyzer_inputs,
-                               unbound_saved_model_dir)
+    transform_fn_future, cache_value_nodes = analysis_graph_builder.build(
+        graph,
+        input_signature,
+        output_signature,
+        input_values_pcoll_dict.keys(),
+        cache_dict=dataset_cache_dict)
 
-        tensor_pcoll_mapping_update = (
-            (input_values, tensor_pcoll_mapping)
-            | 'RunPhase[{}]'.format(level) >> _RunPhase(
-                phase.analyzer_infos, unbound_saved_model_dir, base_temp_dir,
-                input_schema, serialized_tf_config))
+    traverser = nodes.Traverser(common.ConstructBeamPipelineVisitor(extra_args))
+    transform_fn_pcoll = traverser.visit_value_node(transform_fn_future)
 
-        # Update the mapping for all analyzers.
-        tensor_pcoll_mapping.update(tensor_pcoll_mapping_update)
+    if cache_value_nodes is not None:
+      output_cache_pcoll_dict = {}
+      for (dataset_key,
+           cache_key), value_node in six.iteritems(cache_value_nodes):
+        if dataset_key not in output_cache_pcoll_dict:
+          output_cache_pcoll_dict[dataset_key] = {}
+        output_cache_pcoll_dict[dataset_key][cache_key] = (
+            traverser.visit_value_node(value_node))
+    else:
+      output_cache_pcoll_dict = None
 
-      del table_initializers[:]
-      table_initializers.extend(original_table_initializers)
-      saved_model_dir = _make_unique_temp_dir(base_temp_dir)
-      _write_saved_transform(graph, inputs, outputs, saved_model_dir)
-      transform_fn = (
-          tensor_pcoll_mapping
-          | 'ReplaceTensorsWithConstants' >> _ReplaceTensorsWithConstants(
-              saved_model_dir, base_temp_dir, input_values.pipeline))
+    # Infer metadata.  We take the inferred metadata and apply overrides that
+    # refer to values of tensors in the graph.  The override tensors must
+    # be "constant" in that they don't depend on input data.  The tensors can
+    # depend on analyzer outputs though.  This allows us to set metadata that
+    # depends on analyzer outputs. _augment_metadata will use the analyzer
+    # outputs stored in `transform_fn` to compute the metadata in a
+    # deferred manner, once the analyzer outputs are known.
+    metadata = dataset_metadata.DatasetMetadata(
+        schema=schema_inference.infer_feature_schema(output_signature, graph))
 
-      # Infer metadata.  We take the inferred metadata and apply overrides that
-      # refer to values of tensors in the graph.  The override tensors must
-      # be "constant" in that they don't depend on input data.  The tensors can
-      # depend on analyzer outputs though.  This allows us to set metadata that
-      # depends on analyzer outputs. _augment_metadata will use the analyzer
-      # outputs stored in `transform_fn` to compute the metadata in a
-      # deferred manner, once the analyzer outputs are known.
-      metadata = dataset_metadata.DatasetMetadata(
-          schema=impl_helper.infer_feature_schema(outputs))
+    deferred_metadata = (
+        transform_fn_pcoll
+        |
+        'ComputeDeferredMetadata' >> beam.Map(_infer_metadata_from_saved_model))
 
-      deferred_metadata = (
-          transform_fn
-          | 'ComputeDeferredMetadata' >> beam.Map(_augment_metadata, metadata))
+    full_metadata = beam_metadata_io.BeamDatasetMetadata(
+        metadata, deferred_metadata)
 
-      full_metadata = beam_metadata_io.BeamDatasetMetadata(
-          metadata, deferred_metadata)
+    _clear_shared_state_after_barrier(pipeline, transform_fn_pcoll)
 
-      _clear_shared_state_after_barrier(input_values.pipeline, transform_fn)
+    return (transform_fn_pcoll, full_metadata), output_cache_pcoll_dict
 
-      return transform_fn, full_metadata
+
+class AnalyzeDatasetWithCache(_AnalyzeDatasetCommon):
+  """Takes a preprocessing_fn and computes the relevant statistics.
+
+  WARNING: This is experimental.
+
+  Operates similarly to AnalyzeDataset, by computing the required statistics
+  except this will not re-compute statistics when they are already cached, and
+  will write out cache for statistics that it does compute whenever possible.
+
+  Args:
+    preprocessing_fn: A function that accepts and returns a dictionary from
+      strings to `Tensor` or `SparseTensor`s.
+  """
+
+  pass
+
+
+class AnalyzeDataset(_AnalyzeDatasetCommon):
+  """Takes a preprocessing_fn and computes the relevant statistics.
+
+  AnalyzeDataset accepts a preprocessing_fn in its constructor.  When its
+  `expand` method is called on a dataset, it computes all the relevant
+  statistics required to run the transformation described by the
+  preprocessing_fn, and returns a TransformFn representing the application of
+  the preprocessing_fn.
+
+  Args:
+    preprocessing_fn: A function that accepts and returns a dictionary from
+      strings to `Tensor` or `SparseTensor`s.
+  """
+
+  def _extract_input_pvalues(self, dataset):
+    # This method returns all nested pvalues to inform beam of nested pvalues.
+    data, metadata = dataset
+    pvalues = [data]
+    if isinstance(metadata, beam_metadata_io.BeamDatasetMetadata):
+      pvalues.append(metadata.deferred_metadata)
+    return dataset, pvalues
+
+  def expand(self, dataset):
+    input_values, input_metadata = dataset
+    result, cache = super(AnalyzeDataset, self).expand((input_values, None,
+                                                        None, input_metadata))
+    assert not cache
+    return result
 
 
 class AnalyzeAndTransformDataset(beam.PTransform):
@@ -847,6 +854,7 @@ class AnalyzeAndTransformDataset(beam.PTransform):
     _assert_tensorflow_version()
 
   def _extract_input_pvalues(self, dataset):
+    # This method returns all nested pvalues to inform beam of nested pvalues.
     data, metadata = dataset
     pvalues = [data]
     if isinstance(metadata, beam_metadata_io.BeamDatasetMetadata):
@@ -868,6 +876,15 @@ class AnalyzeAndTransformDataset(beam.PTransform):
     # e.g. caching the values of expensive computations done in AnalyzeDataset.
     transform_fn = (
         dataset | 'AnalyzeDataset' >> AnalyzeDataset(self._preprocessing_fn))
+
+    if Context.get_use_deep_copy_optimization():
+      data, metadata = dataset
+
+      # obviates unnecessary data materialization when the input data source is
+      # safe to read more than once.
+      tf.logging.info('Deep copying the dataset before applying transformation')
+      dataset = (deep_copy.deep_copy(data), metadata)
+
     transformed_dataset = ((dataset, transform_fn)
                            | 'TransformDataset' >> TransformDataset())
     return transformed_dataset, transform_fn
@@ -875,13 +892,14 @@ class AnalyzeAndTransformDataset(beam.PTransform):
 
 def _remove_columns_from_metadata(metadata, excluded_columns):
   """Remove columns from metadata without mutating original metadata."""
-  schema = metadata.schema
-  new_schema = dataset_schema.Schema({
-      key: column_schema
-      for key, column_schema in six.iteritems(schema.column_schemas)
-      if key not in excluded_columns
-  })
-  return dataset_metadata.DatasetMetadata(new_schema)
+  feature_spec = metadata.schema.as_feature_spec()
+  domains = metadata.schema.domains()
+  new_feature_spec = {name: spec for name, spec in feature_spec.items()
+                      if name not in excluded_columns}
+  new_domains = {name: spec for name, spec in domains.items()
+                 if name not in excluded_columns}
+  return dataset_metadata.DatasetMetadata(
+      dataset_schema.from_feature_spec(new_feature_spec, new_domains))
 
 
 class TransformDataset(beam.PTransform):
@@ -900,6 +918,7 @@ class TransformDataset(beam.PTransform):
     _assert_tensorflow_version()
 
   def _extract_input_pvalues(self, dataset_and_transform_fn):
+    # This method returns all nested pvalues to inform beam of nested pvalues.
     (data, input_metadata), (transform_fn, output_metadata) = (
         dataset_and_transform_fn)
     pvalues = [data, transform_fn]

@@ -17,388 +17,315 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+# GOOGLE-INITIALIZATION
 
 import numpy as np
-import six
 import tensorflow as tf
-from tensorflow_transform import analyzers
-from tensorflow_transform import api
 from tensorflow_transform import impl_helper
-from tensorflow_transform import mappers
-from tensorflow_transform.tf_metadata import dataset_schema as sch
-import unittest
-from tensorflow.contrib import lookup
-from tensorflow.python.framework import test_util
+from tensorflow_transform import test_case
+from tensorflow_transform.tf_metadata import dataset_schema
+
+_FEATURE_SPEC = {
+    'a': tf.FixedLenFeature([], tf.int64),
+    'b': tf.FixedLenFeature([], tf.float32),
+    'c': tf.FixedLenFeature([1], tf.float32),
+    'd': tf.FixedLenFeature([2, 2], tf.float32),
+    'e': tf.VarLenFeature(tf.string),
+    'f': tf.SparseFeature('idx', 'val', tf.float32, 10),
+}
+_FEED_DICT = {
+    'a': np.array([100, 100]),
+    'b': np.array([1.0, 2.0]),
+    'c': np.array([[2.0], [4.0]]),
+    'd': np.array([[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]]),
+    'e': tf.SparseTensorValue(
+        indices=np.array([(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]),
+        values=np.array(['doe', 'a', 'deer', 'a', 'female', 'deer']),
+        dense_shape=(2, 3)),
+    'f': tf.SparseTensorValue(
+        indices=np.array([(0, 2), (0, 4), (0, 8)]),
+        values=np.array([10.0, 20.0, 30.0]),
+        dense_shape=(2, 10)),
+}
+
+_ROUNDTRIP_CASES = [
+    dict(testcase_name='multiple_features',
+         feature_spec=_FEATURE_SPEC,
+         instances=[{
+             'a': 100,
+             'b': 1.0,
+             'c': [2.0],
+             'd': [[1.0, 2.0], [3.0, 4.0]],
+             'e': ['doe', 'a', 'deer'],
+             'idx': [2, 4, 8],
+             'val': [10.0, 20.0, 30.0],
+         }, {
+             'a': 100,
+             'b': 2.0,
+             'c': [4.0],
+             'd': [[5.0, 6.0], [7.0, 8.0]],
+             'e': ['a', 'female', 'deer'],
+             'idx': [],
+             'val': [],
+         }],
+         feed_dict=_FEED_DICT),
+    dict(testcase_name='multiple_features_ndarrays',
+         feature_spec=_FEATURE_SPEC,
+         instances=[{
+             'a': np.int64(100),
+             'b': np.array(1.0, np.float32),
+             'c': np.array([2.0], np.float32),
+             'd': np.array([[1.0, 2.0], [3.0, 4.0]], np.float32),
+             'e': ['doe', 'a', 'deer'],
+             'idx': np.array([2, 4, 8]),
+             'val': np.array([10.0, 20.0, 30.0]),
+         }, {
+             'a': np.int64(100),
+             'b': np.array(2.0, np.float32),
+             'c': np.array([4.0], np.float32),
+             'd': np.array([[5.0, 6.0], [7.0, 8.0]], np.float32),
+             'e': ['a', 'female', 'deer'],
+             'idx': np.array([], np.int32),
+             'val': np.array([], np.float32),
+         }],
+         feed_dict=_FEED_DICT),
+    dict(testcase_name='empty_var_len_feature',
+         feature_spec={'varlen': tf.VarLenFeature(tf.string)},
+         instances=[{'varlen': []}],
+         feed_dict={
+             'varlen': tf.SparseTensorValue(
+                 indices=np.empty([0, 2]),
+                 values=np.array([]),
+                 dense_shape=[1, 0])
+         }),
+    # Mainly to test the empty-ndarray optimization though this is also
+    # exercised by empty_var_len_feature
+    dict(testcase_name='some_empty_int_var_len_feature',
+         feature_spec={'varlen': tf.VarLenFeature(tf.int64)},
+         instances=[
+             {'varlen': [0]},
+             {'varlen': []},
+             {'varlen': [1]},
+             {'varlen': []}
+         ],
+         feed_dict={
+             'varlen': tf.SparseTensorValue(
+                 indices=np.array([(0, 0), (2, 0)]),
+                 values=np.array([0, 1], np.int64),
+                 dense_shape=(4, 1)),
+         }),
+    dict(testcase_name='some_empty_float_var_len_feature',
+         feature_spec={'varlen': tf.VarLenFeature(tf.float32)},
+         instances=[
+             {'varlen': [0.5]},
+             {'varlen': []},
+             {'varlen': [1.5]},
+             {'varlen': []}
+         ],
+         feed_dict={
+             'varlen': tf.SparseTensorValue(
+                 indices=np.array([(0, 0), (2, 0)]),
+                 values=np.array([0.5, 1.5], np.float32),
+                 dense_shape=(4, 1)),
+         }),
+    dict(testcase_name='some_empty_string_var_len_feature',
+         feature_spec={'varlen': tf.VarLenFeature(tf.string)},
+         instances=[
+             {'varlen': ['a']},
+             {'varlen': []},
+             {'varlen': ['b']},
+             {'varlen': []}
+         ],
+         feed_dict={
+             'varlen': tf.SparseTensorValue(
+                 indices=np.array([(0, 0), (2, 0)]),
+                 values=np.array(['a', 'b'], np.object),
+                 dense_shape=(4, 1)),
+         }),
+    dict(testcase_name='empty_sparse_feature',
+         feature_spec={
+             'sparse': tf.SparseFeature('idx', 'val', tf.float32, 10)
+         },
+         instances=[{'idx': [], 'val': []}],
+         feed_dict={
+             'sparse': tf.SparseTensorValue(
+                 indices=np.empty([0, 2]),
+                 values=np.array([]),
+                 dense_shape=[1, 10])
+         }),
+]
+
+# Non-canonical inputs that will not be the output of to_instance_dicts but
+# are valid inputs to make_feed_dict.
+_MAKE_FEED_DICT_CASES = [
+    dict(testcase_name='none_feature',
+         feature_spec={
+             'varlen_feature': tf.VarLenFeature(tf.int64),
+         },
+         instances=[
+             {'varlen_feature': []},
+             {'varlen_feature': None},
+             {'varlen_feature': [1, 2]}
+         ],
+         feed_dict={
+             'varlen_feature': tf.SparseTensorValue(
+                 indices=np.array([(2, 0), (2, 1)]),
+                 values=np.array([1, 2]),
+                 dense_shape=[3, 2])
+         }),
+]
+
+_MAKE_FEED_LIST_ERROR_CASES = [
+    dict(testcase_name='missing_feature',
+         feature_spec={
+             'a': tf.FixedLenFeature([1], tf.int64),
+             'b': tf.FixedLenFeature([1], tf.int64),
+         },
+         instances=[{'a': 100}],
+         error_msg='b',
+         error_type=KeyError),
+    dict(testcase_name='sparse_feature_index_negative',
+         feature_spec={
+             'a': tf.SparseFeature('idx', 'val', tf.float32, 10)
+         },
+         instances=[{'idx': [-1, 2], 'val': [1.0, 2.0]}],
+         error_msg='has index .* out of range'),
+    dict(testcase_name='sparse_feature_index_too_high',
+         feature_spec={
+             'a': tf.SparseFeature('idx', 'val', tf.float32, 10)
+         },
+         instances=[{'idx': [11, 2], 'val': [1.0, 2.0]}],
+         error_msg='has index .* out of range'),
+    dict(testcase_name='sparse_feature_indices_and_values_different_lengths',
+         feature_spec={
+             'a': tf.SparseFeature('idx', 'val', tf.float32, 10)
+         },
+         instances=[{'idx': [1, 2], 'val': [1]}],
+         error_msg='indices and values of different lengths')
+]
+
+_TO_INSTANCE_DICT_ERROR_CASES = [
+    dict(testcase_name='var_len_with_non_consecutive_indices',
+         feature_spec={
+             'a': tf.VarLenFeature(tf.float32)
+         },
+         feed_dict={
+             'a': tf.SparseTensorValue(
+                 indices=np.array([(0, 2), (0, 4), (0, 8)]),
+                 values=np.array([10.0, 20.0, 30.0]),
+                 dense_shape=(1, 20))
+         },
+         error_msg='cannot be decoded by ListColumnRepresentation'),
+    dict(testcase_name='var_len_with_rank_not_2',
+         feature_spec={
+             'a': tf.VarLenFeature(tf.float32)
+         },
+         feed_dict={
+             'a': tf.SparseTensorValue(
+                 indices=np.array([(0, 0, 1), (0, 0, 2), (0, 0, 3)]),
+                 values=np.array([10.0, 20.0, 30.0]),
+                 dense_shape=(1, 10, 10))
+         },
+         error_msg='cannot be decoded by ListColumnRepresentation'),
+    dict(testcase_name='var_len_with_out_of_order_indices',
+         feature_spec={
+             'a': tf.VarLenFeature(tf.float32)
+         },
+         feed_dict={
+             'a': tf.SparseTensorValue(
+                 indices=np.array([(0, 2), (2, 4), (1, 8)]),
+                 values=np.array([10.0, 20.0, 30.0]),
+                 dense_shape=(3, 20))
+         },
+         error_msg='Encountered out-of-order sparse index'),
+    dict(testcase_name='var_len_with_different_batch_dim_sizes',
+         feature_spec={
+             'a': tf.VarLenFeature(tf.float32),
+             'b': tf.VarLenFeature(tf.float32),
+         },
+         feed_dict={
+             'a': tf.SparseTensorValue(
+                 indices=np.array([(0, 0)]),
+                 values=np.array([10.0]),
+                 dense_shape=(1, 20)),
+             'b': tf.SparseTensorValue(
+                 indices=np.array([(0, 0)]),
+                 values=np.array([10.0]),
+                 dense_shape=(2, 20)),
+         },
+         error_msg=(r'Inconsistent batch sizes: "\w" had batch dimension \d, '
+                    r'"\w" had batch dimension \d')),
+    dict(testcase_name='fixed_len_with_different_batch_dim_sizes',
+         feature_spec={
+             'a': tf.FixedLenFeature([], tf.float32),
+             'b': tf.FixedLenFeature([], tf.float32),
+         },
+         feed_dict={
+             'a': np.array([1]),
+             'b': np.array([1, 2])
+         },
+         error_msg=(r'Inconsistent batch sizes: "\w" had batch dimension \d, '
+                    r'"\w" had batch dimension \d')),
+]
 
 
-class ImplHelperTest(test_util.TensorFlowTestCase):
+class ImplHelperTest(test_case.TransformTestCase):
 
-  def assertSparseValuesEqual(self, a, b):
-    self.assertAllEqual(a.indices, b.indices)
-    self.assertAllEqual(a.values, b.values)
-    self.assertAllEqual(a.dense_shape, b.dense_shape)
-
-  def toSchema(self, feature_spec):
-    return sch.from_feature_spec(feature_spec)
-
-  def testInferFeatureSchema(self):
-    tensors = {
-        'a': tf.placeholder(tf.float32, (None,)),
-        'b': tf.placeholder(tf.string, (1, 2, 3)),
-        'c': tf.placeholder(tf.int64, None)
+  def test_feature_spec_as_batched_placeholders(self):
+    feature_spec = {
+        'fixed_len_float': tf.FixedLenFeature([2, 3], tf.float32),
+        'fixed_len_string': tf.FixedLenFeature([], tf.string),
+        'var_len_int': tf.VarLenFeature(tf.int64)
     }
-    schema = impl_helper.infer_feature_schema(tensors)
-    expected_schema = sch.Schema(column_schemas={
-        'a': sch.ColumnSchema(tf.float32, [],
-                              sch.FixedColumnRepresentation()),
-        'b': sch.ColumnSchema(tf.string, [2, 3],
-                              sch.FixedColumnRepresentation()),
-        'c': sch.ColumnSchema(tf.int64, None,
-                              sch.FixedColumnRepresentation())
-    })
-    self.assertEqual(schema, expected_schema)
+    with tf.Graph().as_default():
+      features = impl_helper.feature_spec_as_batched_placeholders(feature_spec)
+    self.assertCountEqual(
+        features.keys(), ['fixed_len_float', 'fixed_len_string', 'var_len_int'])
+    self.assertEqual(type(features['fixed_len_float']), tf.Tensor)
+    self.assertEqual(features['fixed_len_float'].get_shape().as_list(),
+                     [None, 2, 3])
+    self.assertEqual(type(features['fixed_len_string']), tf.Tensor)
+    self.assertEqual(features['fixed_len_string'].get_shape().as_list(),
+                     [None])
+    self.assertEqual(type(features['var_len_int']), tf.SparseTensor)
+    self.assertEqual(features['var_len_int'].get_shape().as_list(),
+                     [None, None])
 
-  def testInferFeatureSchemaBadRank(self):
-    tensors = {
-        'a': tf.placeholder(tf.float32, ()),
-    }
-    with self.assertRaises(ValueError):
-      impl_helper.infer_feature_schema(tensors)
+  @test_case.named_parameters(*(_ROUNDTRIP_CASES + _MAKE_FEED_DICT_CASES))
+  def test_make_feed_list(self, feature_spec, instances, feed_dict):
+    schema = dataset_schema.from_feature_spec(feature_spec)
+    feature_names = list(feature_spec.keys())
+    expected_feed_list = [feed_dict[key] for key in feature_names]
+    np.testing.assert_equal(
+        impl_helper.make_feed_list(feature_names, schema, instances),
+        expected_feed_list)
 
-  def testMakeFeedDict(self):
-    tensors = {
-        'a': tf.placeholder(tf.int64),
-        'b': tf.placeholder(tf.float32),
-        'c': tf.placeholder(tf.float32),
-        'd': tf.placeholder(tf.float32),
-        'e': tf.sparse_placeholder(tf.string),
-        'f': tf.sparse_placeholder(tf.float32)
-    }
-    schema = self.toSchema({
-        'a': tf.FixedLenFeature(None, tf.int64),
-        'b': tf.FixedLenFeature([], tf.float32),
-        'c': tf.FixedLenFeature([1], tf.float32),
-        'd': tf.FixedLenFeature([2, 2], tf.float32),
-        'e': tf.VarLenFeature(tf.string),
-        'f': tf.SparseFeature('idx', 'val', tf.float32, 10)
-    })
+  @test_case.named_parameters(*_MAKE_FEED_LIST_ERROR_CASES)
+  def test_make_feed_list_error(self,
+                                feature_spec,
+                                instances,
+                                error_msg,
+                                error_type=ValueError):
+    tensors = tf.parse_example(tf.placeholder(tf.string, [None]), feature_spec)
+    schema = dataset_schema.from_feature_spec(feature_spec)
+    with self.assertRaisesRegexp(error_type, error_msg):
+      impl_helper.make_feed_list(tensors, schema, instances)
 
-    # Feed some dense and sparse values.
-    instances = [{
-        'a': 100,
-        'b': 1.0,
-        'c': [2.0],
-        'd': [[1.0, 2.0], [3.0, 4.0]],
-        'e': ['doe', 'a', 'deer'],
-        'f': ([2, 4, 8], [10.0, 20.0, 30.0])
-    }, {
-        'a': 100,
-        'b': 2.0,
-        'c': [4.0],
-        'd': [[5.0, 6.0], [7.0, 8.0]],
-        'e': ['a', 'female', 'deer'],
-        'f': ([], [])
-    }]
+  @test_case.named_parameters(*_ROUNDTRIP_CASES)
+  def test_to_instance_dicts(self, feature_spec, instances, feed_dict):
+    schema = dataset_schema.from_feature_spec(feature_spec)
+    np.testing.assert_equal(
+        instances,
+        impl_helper.to_instance_dicts(schema, feed_dict))
 
-    feed_dict = impl_helper.make_feed_dict(tensors, schema, instances)
-    self.assertSetEqual(set(six.iterkeys(feed_dict)),
-                        set(six.itervalues(tensors)))
-    self.assertAllEqual(feed_dict[tensors['a']], [100, 100])
-    self.assertAllEqual(feed_dict[tensors['b']], [1.0, 2.0])
-    self.assertAllEqual(feed_dict[tensors['c']], [[2.0], [4.0]])
-    self.assertAllEqual(feed_dict[tensors['d']], [[[1.0, 2.0], [3.0, 4.0]],
-                                                  [[5.0, 6.0], [7.0, 8.0]]])
-    self.assertSparseValuesEqual(feed_dict[tensors['e']], tf.SparseTensorValue(
-        indices=[(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)],
-        values=['doe', 'a', 'deer', 'a', 'female', 'deer'],
-        dense_shape=(2, 3)))
-    self.assertSparseValuesEqual(feed_dict[tensors['f']], tf.SparseTensorValue(
-        indices=[(0, 2), (0, 4), (0, 8)], values=[10.0, 20.0, 30.0],
-        dense_shape=(2, 10)))
+  @test_case.named_parameters(*_TO_INSTANCE_DICT_ERROR_CASES)
+  def test_to_instance_dicts_error(self, feature_spec, feed_dict, error_msg,
+                                   error_type=ValueError):
+    schema = dataset_schema.from_feature_spec(feature_spec)
+    with self.assertRaisesRegexp(error_type, error_msg):
+      impl_helper.to_instance_dicts(schema, feed_dict)
 
-    # Feed numpy versions of everything.
-    instances = [{
-        'a': np.int64(100),
-        'b': np.array(1.0, np.float32),
-        'c': np.array([2.0], np.float32),
-        'd': np.array([[1.0, 2.0], [3.0, 4.0]], np.float32),
-        'e': ['doe', 'a', 'deer'],
-        'f': (np.array([2, 4, 8]), np.array([10.0, 20.0, 30.0])),
-    }, {
-        'a': np.int64(100),
-        'b': np.array(2.0, np.float32),
-        'c': np.array([4.0], np.float32),
-        'd': np.array([[5.0, 6.0], [7.0, 8.0]], np.float32),
-        'e': ['a', 'female', 'deer'],
-        'f': (np.array([], np.int32), np.array([], np.float32))
-    }]
-
-    feed_dict = impl_helper.make_feed_dict(tensors, schema, instances)
-    self.assertSetEqual(set(six.iterkeys(feed_dict)),
-                        set(six.itervalues(tensors)))
-    self.assertAllEqual(feed_dict[tensors['a']], [100, 100])
-    self.assertAllEqual(feed_dict[tensors['b']], [1.0, 2.0])
-    self.assertAllEqual(feed_dict[tensors['c']], [[2.0], [4.0]])
-    self.assertAllEqual(feed_dict[tensors['d']], [[[1.0, 2.0], [3.0, 4.0]],
-                                                  [[5.0, 6.0], [7.0, 8.0]]])
-    self.assertSparseValuesEqual(feed_dict[tensors['e']], tf.SparseTensorValue(
-        indices=[(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)],
-        values=['doe', 'a', 'deer', 'a', 'female', 'deer'],
-        dense_shape=(2, 3)))
-    self.assertSparseValuesEqual(feed_dict[tensors['f']], tf.SparseTensorValue(
-        indices=[(0, 2), (0, 4), (0, 8)], values=[10.0, 20.0, 30.0],
-        dense_shape=(2, 10)))
-
-    # Feed some empty sparse values
-    instances = [{
-        'a': 100,
-        'b': 5.0,
-        'c': [1.0],
-        'd': [[1.0, 2.0], [3.0, 4.0]],
-        'e': [],
-        'f': ([], [])
-    }]
-    feed_dict = impl_helper.make_feed_dict(tensors, schema, instances)
-    self.assertSparseValuesEqual(feed_dict[tensors['e']], tf.SparseTensorValue(
-        indices=np.empty([0, 2], np.int64), values=[], dense_shape=(1, 0)))
-    self.assertSparseValuesEqual(feed_dict[tensors['f']], tf.SparseTensorValue(
-        indices=np.empty([0, 2], np.int64), values=[], dense_shape=(1, 10)))
-
-  def testMakeFeedDictError(self):
-    # Missing features.
-    tensors = {
-        'a': tf.placeholder(tf.int64),
-        'b': tf.placeholder(tf.int64)
-    }
-    schema = self.toSchema({
-        'a': tf.FixedLenFeature([1], tf.int64),
-        'b': tf.FixedLenFeature([1], tf.int64)
-    })
-    instances = [{'a': 100}]
-    with self.assertRaises(KeyError):
-      impl_helper.make_feed_dict(tensors, schema, instances)
-
-  def testMalformedSparseFeatures(self):
-    tensors = {
-        'a': tf.sparse_placeholder(tf.int64),
-    }
-
-    # Invalid indices.
-    schema = self.toSchema({
-        'a': tf.SparseFeature('idx', 'val', tf.float32, 10)
-    })
-    instances = [{'a': ([-1, 2], [1.0, 2.0])}]
-    with self.assertRaisesRegexp(
-        ValueError, 'has index .* out of range'):
-      impl_helper.make_feed_dict(tensors, schema, instances)
-
-    instances = [{'a': ([11, 1], [1.0, 2.0])}]
-    with self.assertRaisesRegexp(
-        ValueError, 'has index .* out of range'):
-      impl_helper.make_feed_dict(tensors, schema, instances)
-
-    # Indices and values of different lengths.
-    schema = self.toSchema({
-        'a': tf.SparseFeature('idx', 'val', tf.float32, 10)
-    })
-    instances = [{'a': ([1, 2], [1])}]
-    with self.assertRaisesRegexp(
-        ValueError, 'indices and values of different lengths'):
-      impl_helper.make_feed_dict(tensors, schema, instances)
-
-    # Tuple of the wrong length.
-    instances = [{'a': ([1], [2], [3])}]
-    with self.assertRaisesRegexp(
-        ValueError, 'too many values to unpack'):
-      impl_helper.make_feed_dict(tensors, schema, instances)
-
-  def testMakeOutputDict(self):
-    schema = self.toSchema({
-        'a': tf.FixedLenFeature(None, tf.int64),
-        'b': tf.FixedLenFeature([], tf.float32),
-        'c': tf.FixedLenFeature([1], tf.float32),
-        'd': tf.FixedLenFeature([2, 2], tf.float32),
-        'e': tf.VarLenFeature(tf.string),
-        'f': tf.SparseFeature('idx', 'val', tf.float32, 10)
-    })
-
-    fetches = {
-        'a': np.array([100, 200]),
-        'b': np.array([10.0, 20.0]),
-        'c': np.array([[40.0], [80.0]]),
-        'd': np.array([[[1.0, 2.0], [3.0, 4.0]],
-                       [[5.0, 6.0], [7.0, 8.0]]]),
-        'e': tf.SparseTensorValue(
-            indices=np.array([(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]),
-            values=np.array(['doe', 'a', 'deer', 'a', 'female', 'deer']),
-            dense_shape=(2, 3)),
-        'f': tf.SparseTensorValue(
-            indices=np.array([(0, 2), (0, 4), (0, 8), (1, 4), (1, 8)]),
-            values=np.array([10.0, 20.0, 30.0, 40.0, 50.0]),
-            dense_shape=(2, 20))
-    }
-
-    instance_dicts = impl_helper.to_instance_dicts(schema, fetches)
-    self.assertEqual(2, len(instance_dicts))
-    self.assertSetEqual(set(six.iterkeys(instance_dicts[0])),
-                        set(['a', 'b', 'c', 'd', 'e', 'f']))
-    self.assertAllEqual(instance_dicts[0]['a'], 100)
-    self.assertAllEqual(instance_dicts[0]['b'], 10.0)
-    self.assertAllEqual(instance_dicts[0]['c'], [40.0])
-    self.assertAllEqual(instance_dicts[0]['d'], [[1.0, 2.0], [3.0, 4.0]])
-    self.assertAllEqual(instance_dicts[0]['e'], ['doe', 'a', 'deer'])
-    self.assertEqual(len(instance_dicts[0]['f']), 2)
-    self.assertAllEqual(instance_dicts[0]['f'][0], [2, 4, 8])
-    self.assertAllEqual(instance_dicts[0]['f'][1], [10.0, 20.0, 30.0])
-    self.assertAllEqual(instance_dicts[1]['a'], 200)
-    self.assertAllEqual(instance_dicts[1]['b'], 20.0)
-    self.assertAllEqual(instance_dicts[1]['c'], [80.0])
-    self.assertAllEqual(instance_dicts[1]['d'], [[5.0, 6.0], [7.0, 8.0]])
-    self.assertAllEqual(instance_dicts[1]['e'], ['a', 'female', 'deer'])
-    self.assertEqual(len(instance_dicts[1]['f']), 2)
-    self.assertAllEqual(instance_dicts[1]['f'][0], [4, 8])
-    self.assertAllEqual(instance_dicts[1]['f'][1], [40.0, 50.0])
-
-  def testMakeOutputDictErrorSparse(self):
-    schema = self.toSchema({'a': tf.VarLenFeature(tf.string)})
-
-    # SparseTensor that cannot be represented as VarLenFeature.
-    fetches = {
-        'a': tf.SparseTensorValue(indices=np.array([(0, 2), (0, 4), (0, 8)]),
-                                  values=np.array([10.0, 20.0, 30.0]),
-                                  dense_shape=(1, 20))
-    }
-    with self.assertRaisesRegexp(
-        ValueError, 'cannot be decoded by ListColumnRepresentation'):
-      impl_helper.to_instance_dicts(schema, fetches)
-
-    # SparseTensor of invalid rank.
-    fetches = {
-        'a': tf.SparseTensorValue(
-            indices=np.array([(0, 0, 1), (0, 0, 2), (0, 0, 3)]),
-            values=np.array([10.0, 20.0, 30.0]),
-            dense_shape=(1, 10, 10))
-    }
-    with self.assertRaisesRegexp(
-        ValueError, 'cannot be decoded by ListColumnRepresentation'):
-      impl_helper.to_instance_dicts(schema, fetches)
-
-    # SparseTensor with indices that are out of order.
-    fetches = {
-        'a': tf.SparseTensorValue(indices=np.array([(0, 2), (2, 4), (1, 8)]),
-                                  values=np.array([10.0, 20.0, 30.0]),
-                                  dense_shape=(3, 20))
-    }
-    with self.assertRaisesRegexp(
-        ValueError, 'Encountered out-of-order sparse index'):
-      impl_helper.to_instance_dicts(schema, fetches)
-
-    # SparseTensors with different batch dimension sizes.
-    schema = self.toSchema({
-        'a': tf.VarLenFeature(tf.string),
-        'b': tf.VarLenFeature(tf.string)
-    })
-    fetches = {
-        'a': tf.SparseTensorValue(indices=np.array([(0, 0)]),
-                                  values=np.array([10.0]),
-                                  dense_shape=(1, 20)),
-        'b': tf.SparseTensorValue(indices=np.array([(0, 0)]),
-                                  values=np.array([10.0]),
-                                  dense_shape=(2, 20))
-    }
-    with self.assertRaisesRegexp(
-        ValueError,
-        r'Inconsistent batch sizes: "\w" had batch dimension \d, "\w" had batch'
-        r' dimension \d'):
-      impl_helper.to_instance_dicts(schema, fetches)
-
-  def testMakeOutputDictErrorDense(self):
-    schema = self.toSchema({
-        'a': tf.FixedLenFeature((), tf.string),
-        'b': tf.FixedLenFeature((), tf.string)
-    })
-    # Tensors with different batch dimension sizes.
-    fetches = {
-        'a': np.array([1]),
-        'b': np.array([1, 2])
-    }
-    with self.assertRaisesRegexp(
-        ValueError,
-        r'Inconsistent batch sizes: "\w" had batch dimension \d, "\w" had batch'
-        r' dimension \d'):
-      impl_helper.to_instance_dicts(schema, fetches)
-
-  def testCreatePhasesWithApplyFunctionWithOverlappingInputsAndOutputs(self):
-    string_placeholder = tf.placeholder(tf.string, shape=(None,))
-    def degenerate_function(x):
-      """A function whose input tensors and output tensors overlap."""
-      return x
-    api.apply_function(degenerate_function, string_placeholder)
-
-    phases = impl_helper.create_phases()
-    self.assertEqual(len(phases), 0)
-
-  def testCreatePhasesWithMultipleLevelsOfAnalyzers(self):
-    # Create graph similar to calling scale_to_0_1 except involving multiple
-    # interleavings of analyzers and transforms.
-    float_placeholder = tf.placeholder(tf.float32, shape=(None,))
-    scaled_to_0 = float_placeholder - analyzers.min(float_placeholder)
-    scaled_to_0 / analyzers.max(scaled_to_0)  # pylint: disable=expression-not-assigned
-
-    phases = impl_helper.create_phases()
-    self.assertEqual(len(phases), 2)
-    self.assertEqual(len(phases[0].analyzer_infos), 1)
-    self.assertEqual(len(phases[1].analyzer_infos), 1)
-
-  def testCreatePhasesWithTable(self):
-    # Create a graph with table that can only be run after the first analyzer
-    # has run.  Note converting an integerized string into a float doesn't make
-    # much sense, but is a legal tensorflow computation.
-    string_placeholder = tf.placeholder(tf.string, shape=(None,))
-    integerized = mappers.compute_and_apply_vocabulary(string_placeholder)
-    integerized = tf.to_float(integerized)
-    integerized / analyzers.max(integerized)  # pylint: disable=expression-not-assigned
-
-    phases = impl_helper.create_phases()
-    self.assertEqual(len(phases), 2)
-    self.assertEqual(len(phases[0].analyzer_infos), 1)
-    self.assertEqual(len(phases[1].analyzer_infos), 1)
-    self.assertEqual(len(phases[0].table_initializers), 0)
-    self.assertEqual(len(phases[1].table_initializers), 1)
-
-  def testCreatePhasesWithUnwrappedTable(self):
-    # Create a graph with a table that is not wrapped in `apply_function`.
-    string_placeholder = tf.placeholder(tf.string, shape=(None,))
-    table = lookup.index_table_from_tensor(['a', 'b'])
-    table.lookup(string_placeholder)
-
-    with self.assertRaisesRegexp(ValueError, 'Found table initializers'):
-      impl_helper.create_phases()
-
-  def testCreatePhasesWithControlFlowOpsWrappedInApplyFunction(self):
-    int_placeholder = tf.placeholder(tf.int64, shape=(None,))
-    int_placeholder_minus_10 = api.apply_function(_subtract_ten,
-                                                  int_placeholder)
-    # We need to call an analyzer after the loop because only the transitive
-    # parents of analyzers are inspected by create_phases
-    mappers.scale_to_0_1(int_placeholder_minus_10)
-
-    phases = impl_helper.create_phases()
-    self.assertEqual(len(phases), 1)
-    #  tft.scale_to_0_1 uses a single analyzer: analyzers._min_and_max.
-    self.assertEqual(len(phases[0].analyzer_infos), 1)
-
-  def testCreatePhasesWithControlFlowOpsNotWrappedInApplyFunction(self):
-    int_placeholder = tf.placeholder(tf.int64, shape=(None,))
-    int_placeholder_minus_10 = _subtract_ten(int_placeholder)
-    # We need to call an analyzer after the loop because only the transitive
-    # parents of analyzers are inspected by create_phases
-    mappers.scale_to_0_1(int_placeholder_minus_10)
-
-    with self.assertRaisesRegexp(ValueError, 'Cycle detected'):
-      impl_helper.create_phases()
-
-  def testCopyTensorsCopiesProducesDifferentTensors(self):
+  def test_copy_tensors_produces_different_tensors(self):
     tensors = {
         'dense': tf.placeholder(tf.int64, (None,), name='my_dense_input'),
         'sparse': tf.sparse_placeholder(tf.int64, name='my_sparse_input')
@@ -414,7 +341,7 @@ class ImplHelperTest(test_util.TensorFlowTestCase):
     self.assertNotEqual(tensors['sparse'].dense_shape,
                         copied_tensors['sparse'].dense_shape)
 
-  def testCopyTensorsProducesEquivalentTensors(self):
+  def test_copy_tensors_produces_equivalent_tensors(self):
     tensors = {
         'dense': tf.placeholder(tf.int64, (None,), name='my_dense_input'),
         'sparse': tf.sparse_placeholder(tf.int64, name='my_sparse_input')
@@ -439,8 +366,44 @@ class ImplHelperTest(test_util.TensorFlowTestCase):
       self.assertAllEqual(sample_tensors['sparse'].dense_shape,
                           sparse_value.dense_shape)
 
+  def test_filter_input_tensors(self):
+    with tf.Graph().as_default():
+      a = tf.placeholder(tf.float32, shape=(10, 10))
+      b = tf.sparse.placeholder(tf.float32)
+      c = tf.sparse.placeholder(tf.float32)
+      d = tf.placeholder(tf.float32)
+      e = tf.placeholder(tf.float32)
+      f = tf.placeholder(tf.float32)
+      input_tensors = {
+          'a': a,
+          'b': b,
+          'c': c,
+          'd': d,
+          'e': e,
+          'f': f,
+          'unused_1': tf.placeholder(tf.float32),
+          'unused_2': tf.sparse.placeholder(tf.float32),
+      }
 
-def _subtract_ten(x):
+      matmul_a = tf.matmul(a, a)
+      add_b_c = tf.sparse.add(b, c)
+      add_d_e = d + e
+      add_d_e_f = add_d_e + f
+      output_tensors = [matmul_a, add_b_c, add_d_e_f]
+
+    filtered_input_tensors = impl_helper.filter_input_tensors(
+        input_tensors, output_tensors)
+    self.assertEqual(filtered_input_tensors, {
+        'a': a,
+        'b': b,
+        'c': c,
+        'd': d,
+        'e': e,
+        'f': f,
+    })
+
+
+def _subtract_ten_with_tf_while(x):
   """Subtracts 10 from x using control flow ops.
 
   This function is equivalent to "x - 10" but uses a tf.while_loop, in order
@@ -462,4 +425,4 @@ def _subtract_ten(x):
 
 
 if __name__ == '__main__':
-  unittest.main()
+  test_case.main()

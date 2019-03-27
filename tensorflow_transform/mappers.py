@@ -11,20 +11,89 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Helper functions built on top of TF.Transform."""
+"""The core public API of TFTransform.  Provide functions to transform tensors.
+
+The core tf.Transform API requires a user to construct a
+"preprocessing function" that accepts and returns `Tensor`s.  This function is
+built by composing regular functions built from TensorFlow ops, as well as
+special functions we refer to as `Analyzer`s.  `Analyzer`s behave similarly to
+TensorFlow ops but require a full pass over the whole dataset to compute their
+output value.  The analyzers are defined in analyzers.py, while this module
+provides helper functions that call analyzers and then use the results of the
+anaylzers to transform the original data.
+
+The user-defined preprocessing function should accept and return `Tensor`s that
+are batches from the dataset, whose batch size may vary.  For example the
+following preprocessing function centers the input 'x' while returning 'y'
+unchanged.
+
+import tensorflow_transform as tft
+
+def preprocessing_fn(inputs):
+  x = inputs['x']
+  y = inputs['y']
+
+  # Apply the `mean` analyzer to obtain the mean x.
+  x_mean = tft.mean(x)
+
+  # Subtract the mean.
+  x_centered = x - mean
+
+  # Return a new dictionary containing x_centered, and y unchanged
+  return {
+    'x_centered': x_centered,
+    'y': y
+  }
+
+This user-defined function then must be run using an implementation based on
+some distributed computation framework.  The canonical implementation uses
+Apache Beam as the underlying framework.  See beam/impl.py for how to use the
+Beam implementation.
+"""
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+# GOOGLE-INITIALIZATION
 
 import tensorflow as tf
 from tensorflow_transform import analyzers
-from tensorflow_transform import api
+from tensorflow_transform import schema_inference
 
-from tensorflow.contrib import lookup
+# pylint: disable=g-direct-tensorflow-import
 from tensorflow.contrib.boosted_trees.python.ops import quantile_ops
+from tensorflow.python.ops import check_ops
+from tensorflow.python.ops import lookup_ops
 from tensorflow.python.util import deprecation
+# pylint: enable=g-direct-tensorflow-import
+
+
+def sparse_tensor_to_dense_with_shape(x, shape, default_value=0):
+  """Converts a `SparseTensor` into a dense tensor and sets its shape.
+
+  Args:
+    x: A `SparseTensor`.
+    shape: The desired shape of the densified `Tensor`.
+    default_value: (Optional) Value to set for indices not specified. Defaults
+      to zero.
+
+  Returns:
+    A `Tensor` with the desired shape.
+
+  Raises:
+    ValueError: If input is not a `SparseTensor`.
+  """
+  if not isinstance(x, tf.SparseTensor):
+    raise ValueError('input must be a SparseTensor')
+  new_dense_shape = [
+      x.dense_shape[i] if size is None else size
+      for i, size in enumerate(shape)
+  ]
+  dense = tf.sparse_to_dense(x.indices, new_dense_shape, x.values,
+                             default_value)
+  dense.set_shape(shape)
+  return dense
 
 
 def scale_by_min_max(x,
@@ -95,15 +164,15 @@ def scale_to_z_score(x, elementwise=False, name=None, output_dtype=None):
   (0 delta degrees of freedom), as computed by analyzers.var.
 
   Args:
-    x: A numeric `Tensor`.
+    x: A numeric `Tensor` or `SparseTensor`.
     elementwise: If true, scales each element of the tensor independently;
         otherwise uses the mean and variance of the whole tensor.
     name: (Optional) A name for this operation.
     output_dtype: (Optional) If not None, casts the output tensor to this type.
 
   Returns:
-    A `Tensor` containing the input column scaled to mean 0 and variance 1
-    (standard deviation 1), given by: (x - mean(x)) / std_dev(x).
+    A `Tensor` or `SparseTensor` containing the input column scaled to mean 0
+    and variance 1 (standard deviation 1), given by: (x - mean(x)) / std_dev(x).
     If `x` is floating point, the mean will have the same type as `x`. If `x` is
     integral, the output is cast to tf.float32.
 
@@ -114,14 +183,45 @@ def scale_to_z_score(x, elementwise=False, name=None, output_dtype=None):
     # x_mean will be float16, float32, or float64, depending on type of x.
     x_mean, x_var = analyzers._mean_and_var(  # pylint: disable=protected-access
         x, reduce_instance_dims=not elementwise, output_dtype=output_dtype)
-    return (tf.cast(x, x_mean.dtype) - x_mean) / tf.sqrt(x_var)
+    compose_result_fn = lambda values: values
+    x_values = x
+
+    if isinstance(x, tf.SparseTensor):
+
+      x_values = x.values
+      compose_result_fn = (lambda values: tf.SparseTensor(  # pylint: disable=g-long-lambda
+          indices=x.indices, values=values, dense_shape=x.dense_shape))
+      if elementwise:
+        # Only supports SparseTensors with rank 2.
+        x.get_shape().assert_has_rank(2)
+
+        x_mean = tf.gather(x_mean, x.indices[:, 1])
+        x_var = tf.gather(x_var, x.indices[:, 1])
+
+    numerator = tf.cast(x_values, x_mean.dtype) - x_mean
+    denominator = tf.sqrt(x_var)
+    cond = tf.not_equal(denominator, 0)
+
+    if elementwise and isinstance(x, tf.Tensor):
+      # Repeats cond when necessary across the batch dimension for it to be
+      # compatible with the shape of numerator.
+      cond = tf.cast(
+          tf.zeros_like(numerator) + tf.cast(cond, numerator.dtype),
+          dtype=tf.bool)
+
+    deviation_values = tf.where(cond, tf.divide(numerator, denominator),
+                                numerator)
+    return compose_result_fn(deviation_values)
 
 
 def tfidf(x, vocab_size, smooth=True, name=None):
   """Maps the terms in x to their term frequency * inverse document frequency.
 
-  The inverse document frequency of a term is calculated as 1+
-  log((corpus size + 1) / (document frequency of term + 1)) by default.
+  The term frequency of a term in a document is calculated as
+  (count of term in document) / (document size)
+
+  The inverse document frequency of a term is, by default, calculated as
+  1 + log((corpus size + 1) / (count of documents containing term + 1)).
 
   Example usage:
     example strings [["I", "like", "pie", "pie", "pie"], ["yum", "yum", "pie]]
@@ -131,8 +231,8 @@ def tfidf(x, vocab_size, smooth=True, name=None):
     out: SparseTensor(indices=[[0, 0], [0, 1], [0, 2], [1, 0], [1, 1]],
                       values=[1, 2, 0, 3, 0])
          SparseTensor(indices=[[0, 0], [0, 1], [0, 2], [1, 0], [1, 1]],
-                      values=[(1/5)*(log(3/2)+1), (1/5)*(log(3/2)+1), (1/5),
-                              (1/3), (2/3)*(log(3/2)+1])
+                      values=[(1/5)*(log(3/2)+1), (1/5)*(log(3/2)+1), (3/5),
+                              (2/3)*(log(3/2)+1), (1/3)]
     NOTE that the first doc's duplicate "pie" strings have been combined to
     one output, as have the second doc's duplicate "yum" strings.
 
@@ -221,8 +321,8 @@ def _to_term_frequency(x, vocab_size):
 
   Args:
     x : a SparseTensor of int64 representing string indices in vocab.
-    vocab_size: An int - the count of vocab used to turn the string into int64s
-        including any OOV buckets.
+    vocab_size: A scalar int64 Tensor - the count of vocab used to turn the
+        string into int64s including any OOV buckets.
 
   Returns:
     a SparseTensor with the count of times a term appears in a document at
@@ -231,6 +331,7 @@ def _to_term_frequency(x, vocab_size):
   """
   # Construct intermediary sparse tensor with indices
   # [<doc>, <term_index_in_doc>, <vocab_id>] and tf.ones values.
+  vocab_size = tf.convert_to_tensor(vocab_size, dtype=tf.int64)
   split_indices = tf.to_int64(
       tf.split(x.indices, axis=1, num_or_size_splits=2))
   expanded_values = tf.to_int64(tf.expand_dims(x.values, 1))
@@ -238,9 +339,9 @@ def _to_term_frequency(x, vocab_size):
       [split_indices[0], split_indices[1], expanded_values], axis=1)
 
   next_values = tf.ones_like(x.values)
-  vocab_size_as_tensor = tf.constant([vocab_size], dtype=tf.int64)
+  expanded_vocab_size = tf.expand_dims(vocab_size, 0)
   next_shape = tf.concat(
-      [x.dense_shape, vocab_size_as_tensor], 0)
+      [x.dense_shape, expanded_vocab_size], 0)
 
   next_tensor = tf.SparseTensor(
       indices=tf.to_int64(next_index),
@@ -318,13 +419,22 @@ def _count_docs_with_term(term_frequency):
   return tf.expand_dims(out, 0)
 
 
-def compute_and_apply_vocabulary(x,
-                                 default_value=-1,
-                                 top_k=None,
-                                 frequency_threshold=None,
-                                 num_oov_buckets=0,
-                                 vocab_filename=None,
-                                 name=None):
+def compute_and_apply_vocabulary(
+    x,
+    default_value=-1,
+    top_k=None,
+    frequency_threshold=None,
+    num_oov_buckets=0,
+    vocab_filename=None,
+    weights=None,
+    labels=None,
+    use_adjusted_mutual_info=False,
+    min_diff_from_avg=0.0,
+    coverage_top_k=None,
+    coverage_frequency_threshold=None,
+    key_fn=None,
+    fingerprint_shuffle=False,
+    name=None):
   r"""Generates a vocabulary for `x` and maps it to an integer with this vocab.
 
   In case one of the tokens contains the '\n' or '\r' characters or is empty it
@@ -337,7 +447,7 @@ def compute_and_apply_vocabulary(x,
   operation.
 
   Args:
-    x: A `Tensor` or `SparseTensor` of type tf.string.
+    x: A `Tensor` or `SparseTensor` of type tf.string or tf.int[8|16|32|64].
     default_value: The value to use for out-of-vocabulary values, unless
       'num_oov_buckets' is greater than zero.
     top_k: Limit the generated vocabulary to the first `top_k` elements. If set
@@ -357,22 +467,53 @@ def compute_and_apply_vocabulary(x,
       NOTE in order to make your pipelines resilient to implementation details
       please set `vocab_filename` when you are using the vocab_filename on a
       downstream component.
+    weights: (Optional) Weights `Tensor` for the vocabulary. It must have the
+      same shape as x.
+    labels: (Optional) Labels `Tensor` for the vocabulary. It must have dtype
+      int64, have values 0 or 1, and have the same shape as x.
+    use_adjusted_mutual_info: If true, use adjusted mutual information.
+    min_diff_from_avg: Mutual information of a feature will be adjusted to zero
+      whenever the difference between count of the feature with any label and
+      its expected count is lower than min_diff_from_average.
+    coverage_top_k: (Optional), (Experimental) The minimum number of elements
+      per key to be included in the vocabulary.
+    coverage_frequency_threshold: (Optional), (Experimental) Limit the coverage
+      arm of the vocabulary only to elements whose absolute frequency is >= this
+      threshold for a given key.
+    key_fn: (Optional), (Experimental) A fn that takes in a single entry of `x`
+      and returns the corresponding key for coverage calculation. If this is
+      `None`, no coverage arm is added to the vocabulary.
+    fingerprint_shuffle: (Optional), (Experimental) Whether to sort the
+      vocabularies by fingerprint instead of counts. This is useful for load
+      balancing on the training parameter servers. Shuffle only happens while
+      writing the files, so all the filters above will still take effect.
     name: (Optional) A name for this operation.
 
   Returns:
     A `Tensor` or `SparseTensor` where each string value is mapped to an
-    integer; each unique string value is mapped to a different integer and
-    integers are consecutive and start from default_value.
+    integer. Each unique string value that appears in the vocabulary
+    is mapped to a different integer and integers are consecutive starting from
+    zero. String value not in the vocabulary is assigned default_value.
 
   Raises:
     ValueError: If `top_k` or `frequency_threshold` is negative.
+      If `coverage_top_k` or `coverage_frequency_threshold` is negative.
   """
   with tf.name_scope(name, 'compute_and_apply_vocabulary'):
     deferred_vocab_and_filename = analyzers.vocabulary(
         x=x,
         top_k=top_k,
         frequency_threshold=frequency_threshold,
-        vocab_filename=vocab_filename)
+        vocab_filename=vocab_filename,
+        weights=weights,
+        labels=labels,
+        use_adjusted_mutual_info=use_adjusted_mutual_info,
+        min_diff_from_avg=min_diff_from_avg,
+        coverage_top_k=coverage_top_k,
+        coverage_frequency_threshold=coverage_frequency_threshold,
+        key_fn=key_fn,
+        fingerprint_shuffle=fingerprint_shuffle,
+        name=name)
     return apply_vocabulary(
         x, deferred_vocab_and_filename, default_value, num_oov_buckets)
 
@@ -385,6 +526,8 @@ def string_to_int(x,
                   frequency_threshold=None,
                   num_oov_buckets=0,
                   vocab_filename=None,
+                  weights=None,
+                  labels=None,
                   name=None):
   r"""See `tft.compute_and_apply_vocabulary`."""
   return compute_and_apply_vocabulary(
@@ -394,6 +537,8 @@ def string_to_int(x,
       frequency_threshold=frequency_threshold,
       num_oov_buckets=num_oov_buckets,
       vocab_filename=vocab_filename,
+      weights=weights,
+      labels=labels,
       name=name)
 
 
@@ -414,9 +559,9 @@ def apply_vocabulary(x,
   files. This behavior will likely be fixed/improved in the future.
 
   Args:
-    x: A `Tensor` or `SparseTensor` of type tf.string to which the vocabulary
-      transformation should be applied.
-      The column names are those intended for the transformed tensors.
+    x: A categorical `Tensor` or `SparseTensor` of type tf.string or
+      tf.int[8|16|32|64] to which the vocabulary transformation should be
+      applied. The column names are those intended for the transformed tensors.
     deferred_vocab_filename_tensor: The deferred vocab filename tensor as
       returned by `tft.vocabulary`.
     default_value: The value to use for out-of-vocabulary values, unless
@@ -424,31 +569,34 @@ def apply_vocabulary(x,
     num_oov_buckets:  Any lookup of an out-of-vocabulary token will return a
       bucket ID based on its hash if `num_oov_buckets` is greater than zero.
       Otherwise it is assigned the `default_value`.
-    lookup_fn: Optional lookup function, if specified it should take a
-      tensor and a deferred vocab filename as an input and return a lookup `op`
-      along with the table size, by default `apply_vocab` performs a
-      lookup.string_to_index_table_from_file for the table lookup.
+    lookup_fn: Optional lookup function, if specified it should take a tensor
+      and a deferred vocab filename as an input and return a lookup `op` along
+      with the table size, by default `apply_vocab` performs a
+      lookup_ops.index_table_from_file for the table lookup.
     name: (Optional) A name for this operation.
 
   Returns:
     A `Tensor` or `SparseTensor` where each string value is mapped to an
-    integer; each unique string value is mapped to a different integer and
-    integers are consecutive and start from default_value.
+    integer. Each unique string value that appears in the vocabulary
+    is mapped to a different integer and integers are consecutive
+    starting from zero, and string value not in the vocabulary is
+    assigned default_value.
   """
-
-  def _apply_vocabulary(y, deferred_vocab_filename_tensor):
-    table = lookup.index_table_from_file(
-        deferred_vocab_filename_tensor,
-        num_oov_buckets=num_oov_buckets,
-        default_value=default_value)
-    table_size = table.size()
-    return table.lookup(y), table_size
-
   with tf.name_scope(name, 'apply_vocab'):
-    lookup_fn = lookup_fn or _apply_vocabulary
+    if x.dtype != tf.string and not x.dtype.is_integer:
+      raise tf.errors.InvalidArgumentError(
+          'expected tf.string or tf.int[8|16|32|64] but got %r' % x.dtype)
 
-    result, table_size = api.apply_function(
-        lookup_fn, x, deferred_vocab_filename_tensor)
+    if lookup_fn:
+      result, table_size = lookup_fn(x, deferred_vocab_filename_tensor)
+    else:
+      table = lookup_ops.index_table_from_file(
+          deferred_vocab_filename_tensor,
+          num_oov_buckets=num_oov_buckets,
+          default_value=default_value,
+          key_dtype=x.dtype)
+      table_size = table.size()
+      result = table.lookup(x)
 
     # Specify schema overrides which will override the values in the schema
     # with the min and max values, which are deferred as they are only known
@@ -461,7 +609,7 @@ def apply_vocabulary(x,
     if num_oov_buckets <= 0:
       min_value = tf.minimum(min_value, default_value)
       max_value = tf.maximum(max_value, default_value)
-    api.set_tensor_schema_overrides(
+    schema_inference.set_tensor_schema_override(
         result.values if isinstance(result, tf.SparseTensor) else result,
         min_value, max_value)
 
@@ -505,6 +653,9 @@ def segment_indices(segment_ids, name=None):
     A `Tensor` containing the indices within each segment.
   """
   with tf.name_scope(name, 'segment_indices'):
+    # TODO(KesterTong): This is a fundamental operation for segments, write a C++
+    # op to do this.
+    # TODO(KesterTong): Add a check that segment_ids are increasing.
     segment_lengths = tf.segment_sum(tf.ones_like(segment_ids), segment_ids)
     segment_starts = tf.gather(tf.concat([[0], tf.cumsum(segment_lengths)], 0),
                                segment_ids)
@@ -677,11 +828,14 @@ def hash_strings(strings, hash_buckets, key=None, name=None):
   return tf.string_to_hash_bucket_strong(strings, hash_buckets, key, name=name)
 
 
-def bucketize(x, num_buckets, epsilon=None, name=None):
+def bucketize(x, num_buckets, epsilon=None, weights=None, name=None):
   """Returns a bucketized column, with a bucket index assigned to each input.
 
   Args:
-    x: A numeric input `Tensor` whose values should be mapped to buckets.
+    x: A numeric input `Tensor` or `SparseTensor` whose values should be mapped
+      to buckets.  For a `SparseTensor` only non-missing values will be included
+      in the quantiles computation, and the result of `bucketize` will be a
+      `SparseTensor` with non-missing values mapped to buckets.
     num_buckets: Values in the input `x` are divided into approximately
       equal-sized buckets, where the number of buckets is num_buckets.
       This is a hint. The actual number of buckets computed can be
@@ -696,6 +850,8 @@ def bucketize(x, num_buckets, epsilon=None, name=None):
       error tolerance, because more buckets will result in smaller range for
       each bucket, and so we want the boundaries to be less fuzzy.
       See analyzers.quantiles() for details.
+    weights: (Optional) Weights tensor for the quantiles. Tensor must have the
+      same shape as x.
     name: (Optional) A name for this operation.
 
   Returns:
@@ -720,16 +876,241 @@ def bucketize(x, num_buckets, epsilon=None, name=None):
       # See explanation in args documentation for epsilon.
       epsilon = min(1.0 / num_buckets, 0.01)
 
-    bucket_boundaries = analyzers.quantiles(x, num_buckets, epsilon)
+    x_values = x.values if isinstance(x, tf.SparseTensor) else x
+    bucket_boundaries = analyzers.quantiles(x_values, num_buckets, epsilon,
+                                            weights)
     return apply_buckets(x, bucket_boundaries)
+
+
+def bucketize_per_key(x, key, num_buckets, epsilon=None, name=None):
+  """Returns a bucketized column, with a bucket index assigned to each input.
+
+  Args:
+    x: A numeric input `Tensor` or `SparseTensor` with rank 1, whose values
+      should be mapped to buckets.  `SparseTensor`s will have their non-missing
+      values mapped and missing values left as missing.
+    key: A Tensor with the same shape as `x` and dtype tf.string.  If `x` is
+      a `SparseTensor`, `key` must exactly match `x` in everything except
+      values, i.e. indices and dense_shape must be identical.
+    num_buckets: Values in the input `x` are divided into approximately
+      equal-sized buckets, where the number of buckets is num_buckets.
+    epsilon: (Optional) see `bucketize`
+    name: (Optional) A name for this operation.
+
+  Returns:
+    A `Tensor` of the same shape as `x`, with each element in the
+    returned tensor representing the bucketized value. Bucketized value is
+    in the range [0, actual_num_buckets).
+
+  Raises:
+    ValueError: If value of num_buckets is not > 1.
+  """
+  with tf.name_scope(name, 'bucketize_per_key'):
+    if not isinstance(num_buckets, int):
+      raise TypeError(
+          'num_buckets must be an int, got {}'.format(type(num_buckets)))
+
+    if num_buckets < 1:
+      raise ValueError('Invalid num_buckets {}'.format(num_buckets))
+
+    if epsilon is None:
+      # See explanation in args documentation for epsilon.
+      epsilon = min(1.0 / num_buckets, 0.01)
+
+    key_vocab, bucket_boundaries = analyzers._quantiles_per_key(  # pylint: disable=protected-access
+        x.values if isinstance(x, tf.SparseTensor) else x,
+        key.values if isinstance(key, tf.SparseTensor) else key,
+        num_buckets, epsilon)
+    return _apply_buckets_with_keys(x, key, key_vocab, bucket_boundaries)
+
+
+def _lookup_key(key, key_vocab):
+  table = lookup_ops.index_table_from_tensor(key_vocab, default_value=-1)
+  key_indices = table.lookup(key)
+  with tf.control_dependencies([tf.assert_non_negative(key_indices)]):
+    return tf.identity(key_indices)
+
+
+def _combine_bucket_boundaries(bucket_boundaries, epsilon=0.1):
+  """Combine all boundaries into a single vector with offsets.
+
+  We offset boundaries so that this vector is increasing, and store the offsets.
+  In order to make the vector strictly increasing, we use an arbitrary epsilon
+  value.  E.g. if
+
+  bucket_boundaries = [[0, 5, 7], [2, 3, 4]]
+
+  then the second row will be offset to move the first bucket boundary from
+  2 to 7 + epsilon = 7.1.  Thus we will have:
+
+  combined_boundaries = [0, 5, 7, 7.1, 8.1, 9.1]
+  offsets = [0, 5.1]
+
+  Args:
+    bucket_boundaries: A Tensor with shape (num_keys, num_buckets) where each
+        row is increasing.
+    epsilon: The distance between values to use when stacking rows of
+        `bucket_boundaries` into a single vector.
+
+  Returns:
+    A pair (combined_boundaries, offsets) where combined_boundaries has shape
+        (num_keys * num_buckets,) and offsets has shape (num_keys,)
+  """
+  # For each row of bucket_boundaries, compute where that row should start in
+  # combined_boundaries.  This is given by taking the cumulative sum of the
+  # size of the segment in the number-line taken up by each row (including the
+  # extra padding of epsilon).
+  row_starts = tf.cumsum(
+      epsilon + bucket_boundaries[:, -1] - bucket_boundaries[:, 0],
+      exclusive=True)
+  offsets = row_starts - bucket_boundaries[:, 0]
+  combined_boundaries = tf.reshape(
+      bucket_boundaries + tf.expand_dims(offsets, axis=1), [-1])
+  return combined_boundaries, offsets
+
+
+def _apply_buckets_with_keys(x, key, key_vocab, bucket_boundaries, name=None):
+  """Bucketize a Tensor or SparseTensor where boundaries depend on the index.
+
+  Args:
+    x: A 1-d Tensor or SparseTensor.
+    key: A 1-d Tensor or SparseTensor with the same size as x.
+    key_vocab: A vocab containing all keys.  Must be exhaustive, an
+        out-of-vocab entry in `key` will cause a crash.
+    bucket_boundaries: A rank-2 Tensor of shape (key_size, num_buckets)
+    name: (Optional) A name for this operation.
+
+  Returns:
+    A tensor with the same shape as `x` and dtype tf.int64
+  """
+  with tf.name_scope(name, 'apply_buckets_with_keys'):
+    x_values = x.values if isinstance(x, tf.SparseTensor) else x
+    key_values = key.values if isinstance(key, tf.SparseTensor) else key
+
+    x_values = tf.to_float(x_values)
+    # Convert `key_values` to indices in key_vocab.  We must use apply_function
+    # since this uses a Table.
+    key_indices = _lookup_key(key_values, key_vocab)
+
+    combined_boundaries, offsets = _combine_bucket_boundaries(bucket_boundaries)
+
+    # Apply the per-key offsets to x, which produces offset buckets (where the
+    # bucket offset is an integer offset).  Then remove this offset to get the
+    # actual per-key buckets for x.
+    offset_x = x_values + tf.gather(offsets, key_indices)
+    offset_buckets = tf.to_int64(quantile_ops.bucketize_with_input_boundaries(
+        offset_x, combined_boundaries))
+    num_buckets = tf.to_int64(tf.shape(bucket_boundaries)[1])
+    bucketized_values = tf.clip_by_value(
+        offset_buckets - key_indices * num_buckets, 0, num_buckets)
+
+    # Attach the relevant metadata to result, so that the corresponding
+    # output feature will have this metadata set.
+    min_value = tf.constant(0, tf.int64)
+    max_value = num_buckets
+    schema_inference.set_tensor_schema_override(
+        bucketized_values, min_value, max_value)
+
+    if isinstance(x, tf.SparseTensor):
+      result = tf.SparseTensor(x.indices, bucketized_values, x.dense_shape)
+    else:
+      result = bucketized_values
+
+    return result
+
+
+# TODO(b/127971746): Consider if/how SparseTensor input should be handled.
+def apply_buckets_with_interpolation(x, bucket_boundaries, name=None):
+  """Interpolates within the provided buckets and then normalizes to 0 to 1.
+
+  A method for normalizing continuous numeric data to the range [0, 1].
+  Numeric values are first bucketized according to the provided boundaries, then
+  linearly interpolated within their respective bucket ranges. Finally, the
+  interpolated values are normalized to the range [0, 1]. Values that are
+  less than or equal to the lowest boundary, or greater than or equal to the
+  highest boundary, will be mapped to 0 and 1 respectively.
+
+  Args:
+    x: A numeric input `Tensor` (tf.float32, tf.float64, tf.int32, tf.int64).
+    bucket_boundaries: Sorted bucket boundaries as a rank-2 `Tensor`.
+    name: (Optional) A name for this operation.
+
+  Returns:
+    A `Tensor` of the same shape as `x`, normalized to the range [0, 1]. If the
+      input x is tf.float64, the returned values will be tf.float64.
+      Otherwise, returned values are tf.float32.
+
+  """
+  with tf.name_scope(name, 'buckets_with_interpolation'):
+    tf.assert_rank(bucket_boundaries, 2)
+    if not check_ops.is_numeric_tensor(x):
+      raise tf.errors.InvalidArgumentError(
+          'Input tensor to be normalized must be numeric.')
+    return_type = tf.float64 if x.dtype == tf.float64 else tf.float32
+    num_boundaries = tf.to_int64(tf.shape(bucket_boundaries)[1])
+
+    # The TF BucketizeWithInputBoundaries Op expects boundaries as tf.float32.
+    bucket_boundaries = tf.cast(bucket_boundaries, tf.float32)
+    bucket_indices = tf.cast(
+        quantile_ops.bucketize_with_input_boundaries(
+            x, boundaries=bucket_boundaries, name='assign_buckets'), tf.int64)
+
+    # Get max, min, and width of the corresponding bucket for each element.
+    bucket_max = tf.dtypes.cast(
+        tf.gather(
+            tf.concat([bucket_boundaries[0], bucket_boundaries[:, -1]], axis=0),
+            bucket_indices), return_type)
+    bucket_min = tf.dtypes.cast(
+        tf.gather(
+            tf.concat([bucket_boundaries[:, 0], bucket_boundaries[0]], axis=0),
+            bucket_indices), return_type)
+    bucket_width = bucket_max - bucket_min
+    zeros = tf.zeros_like(x, dtype=return_type)
+    ones = tf.ones_like(x, dtype=return_type)
+
+    # Linearly interpolate each value within its respective bucket range.
+    interpolation_value = ((tf.dtypes.cast(x, return_type) - bucket_min) /
+                           bucket_width)
+    bucket_interpolation = tf.verify_tensor_all_finite(
+        tf.where(
+            # If bucket index is first or last, which represents "less than
+            # min" and "greater than max" respectively, the bucket logically
+            # has an infinite width and we can't meaningfully interpolate.
+            tf.logical_or(
+                tf.equal(bucket_indices, 0),
+                tf.equal(bucket_indices, num_boundaries)),
+            zeros,
+            tf.where(
+                # If the bucket width is zero due to numerical imprecision,
+                # there is no point in interpolating
+                tf.equal(bucket_width, 0.0),
+                ones / 2.0,
+                # Finally, for a bucket with a valid width, we can interpolate.
+                interpolation_value)),
+        'bucket_interpolation')
+    bucket_indices_with_interpolation = tf.dtypes.cast(
+        tf.maximum(bucket_indices - 1, 0), return_type) + bucket_interpolation
+
+    # Normalize the interpolated values to the range [0, 1].
+    denominator = tf.dtypes.cast(tf.maximum(num_boundaries - 1, 1), return_type)
+    normalized_values = tf.div(bucket_indices_with_interpolation, denominator)
+    # If there is only one boundary, all values < the boundary are 0, all values
+    # >= the boundary are 1.
+    single_boundary_values = lambda: tf.where(  # pylint: disable=g-long-lambda
+        tf.equal(bucket_indices, 0), zeros, ones)
+    return tf.cond(
+        tf.equal(num_boundaries, 1),
+        single_boundary_values, lambda: normalized_values)
 
 
 def apply_buckets(x, bucket_boundaries, name=None):
   """Returns a bucketized column, with a bucket index assigned to each input.
 
   Args:
-    x: A numeric input `Tensor` whose values should be mapped to buckets.
-    bucket_boundaries: The bucket boundaries represented as a list.
+    x: A numeric input `Tensor` or `SparseTensor` whose values should be mapped
+        to buckets.  For `SparseTensor`s, the non-missing values will be mapped
+        to buckets and missing value left missing.
+    bucket_boundaries: The bucket boundaries represented as a rank 2 `Tensor`.
     name: (Optional) A name for this operation.
 
   Returns:
@@ -737,18 +1118,26 @@ def apply_buckets(x, bucket_boundaries, name=None):
     returned tensor representing the bucketized value. Bucketized value is
     in the range [0, len(bucket_boundaries)].
   """
+  tf.assert_rank(bucket_boundaries, 2)
   with tf.name_scope(name, 'apply_buckets'):
+    x_values = x.values if isinstance(x, tf.SparseTensor) else x
     buckets = quantile_ops.bucketize_with_input_boundaries(
-        x, boundaries=bucket_boundaries, name='assign_buckets')
+        x_values, boundaries=bucket_boundaries, name='assign_buckets')
     # Convert to int64 because int32 is not compatible with tf.Example parser.
     # See _TF_EXAMPLE_ALLOWED_TYPES in FixedColumnRepresentation()
     # in tf_metadata/dataset_schema.py
-    result = tf.to_int64(buckets)
+    bucketized_values = tf.to_int64(buckets)
 
     # Attach the relevant metadata to result, so that the corresponding
     # output feature will have this metadata set.
     min_value = tf.constant(0, tf.int64)
     max_value = tf.shape(bucket_boundaries)[1]
-    api.set_tensor_schema_overrides(result, min_value, max_value)
+    schema_inference.set_tensor_schema_override(
+        bucketized_values, min_value, max_value)
+
+    if isinstance(x, tf.SparseTensor):
+      result = tf.SparseTensor(x.indices, bucketized_values, x.dense_shape)
+    else:
+      result = bucketized_values
 
     return result

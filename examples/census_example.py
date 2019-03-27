@@ -23,26 +23,34 @@ import os
 import pprint
 import tempfile
 
+# GOOGLE-INITIALIZATION
 
+import apache_beam as beam
 import tensorflow as tf
 import tensorflow_transform as tft
-from apache_beam.io import textio
-from apache_beam.io import tfrecordio
-
-from tensorflow_transform.beam import impl as beam_impl
-from tensorflow_transform.beam.tft_beam_io import transform_fn_io
+import tensorflow_transform.beam as tft_beam
 from tensorflow_transform.tf_metadata import dataset_metadata
 from tensorflow_transform.tf_metadata import dataset_schema
 
-import apache_beam as beam
 
 CATEGORICAL_FEATURE_KEYS = [
-    'workclass', 'education', 'marital-status', 'occupation', 'relationship',
-    'race', 'sex', 'native-country'
+    'workclass',
+    'education',
+    'marital-status',
+    'occupation',
+    'relationship',
+    'race',
+    'sex',
+    'native-country',
 ]
 NUMERIC_FEATURE_KEYS = [
-    'age', 'education-num', 'capital-gain', 'capital-loss',
-    'hours-per-week'
+    'age',
+    'capital-gain',
+    'capital-loss',
+    'hours-per-week',
+]
+OPTIONAL_NUMERIC_FEATURE_KEYS = [
+    'education-num',
 ]
 LABEL_KEY = 'label'
 
@@ -72,26 +80,18 @@ class MapAndFilterErrors(beam.PTransform):
   def expand(self, pcoll):
     return pcoll | beam.ParDo(self._MapAndFilterErrorsDoFn(self._fn))
 
+RAW_DATA_FEATURE_SPEC = dict(
+    [(name, tf.FixedLenFeature([], tf.string))
+     for name in CATEGORICAL_FEATURE_KEYS] +
+    [(name, tf.FixedLenFeature([], tf.float32))
+     for name in NUMERIC_FEATURE_KEYS] +
+    [(name, tf.VarLenFeature(tf.float32))
+     for name in OPTIONAL_NUMERIC_FEATURE_KEYS] +
+    [(LABEL_KEY, tf.FixedLenFeature([], tf.string))]
+)
 
-def _create_raw_metadata():
-  """Create a DatasetMetadata for the raw data."""
-  column_schemas = {
-      key: dataset_schema.ColumnSchema(
-          tf.string, [], dataset_schema.FixedColumnRepresentation())
-      for key in CATEGORICAL_FEATURE_KEYS
-  }
-  column_schemas.update({
-      key: dataset_schema.ColumnSchema(
-          tf.float32, [], dataset_schema.FixedColumnRepresentation())
-      for key in NUMERIC_FEATURE_KEYS
-  })
-  column_schemas[LABEL_KEY] = dataset_schema.ColumnSchema(
-      tf.string, [], dataset_schema.FixedColumnRepresentation())
-  raw_data_metadata = dataset_metadata.DatasetMetadata(dataset_schema.Schema(
-      column_schemas))
-  return raw_data_metadata
-
-RAW_DATA_METADATA = _create_raw_metadata()
+RAW_DATA_METADATA = dataset_metadata.DatasetMetadata(
+    dataset_schema.from_feature_spec(RAW_DATA_FEATURE_SPEC))
 
 # Constants used for training.  Note that the number of instances will be
 # computed by tf.Transform in future versions, in which case it can be read from
@@ -136,6 +136,16 @@ def transform_data(train_data_file, test_data_file, working_dir):
     for key in NUMERIC_FEATURE_KEYS:
       outputs[key] = tft.scale_to_0_1(outputs[key])
 
+    for key in OPTIONAL_NUMERIC_FEATURE_KEYS:
+      # This is a SparseTensor because it is optional. Here we fill in a default
+      # value when it is missing.
+      dense = tf.sparse_to_dense(outputs[key].indices,
+                                 [outputs[key].dense_shape[0], 1],
+                                 outputs[key].values, default_value=0.)
+      # Reshaping from a batch of vectors of size 1 to a batch to scalars.
+      dense = tf.squeeze(dense, axis=1)
+      outputs[key] = tft.scale_to_0_1(dense)
+
     # For all categorical columns except the label column, we generate a
     # vocabulary but do not modify the feature.  This vocabulary is instead
     # used in the trainer, by means of a feature column, to convert the feature
@@ -144,17 +154,15 @@ def transform_data(train_data_file, test_data_file, working_dir):
       tft.vocabulary(inputs[key], vocab_filename=key)
 
     # For the label column we provide the mapping from string to index.
-    def convert_label(label):
-      table = tf.contrib.lookup.index_table_from_tensor(['>50K', '<=50K'])
-      return table.lookup(label)
-    outputs[LABEL_KEY] = tft.apply_function(convert_label, outputs[LABEL_KEY])
+    table = tf.contrib.lookup.index_table_from_tensor(['>50K', '<=50K'])
+    outputs[LABEL_KEY] = table.lookup(outputs[LABEL_KEY])
 
     return outputs
 
   # The "with" block will create a pipeline, and run that pipeline at the exit
   # of the block.
   with beam.Pipeline() as pipeline:
-    with beam_impl.Context(temp_dir=tempfile.mkdtemp()):
+    with tft_beam.Context(temp_dir=tempfile.mkdtemp()):
       # Create a coder to read the census data with the schema.  To do this we
       # need to list all columns in order since the schema doesn't specify the
       # order of columns in the csv.
@@ -177,7 +185,7 @@ def transform_data(train_data_file, test_data_file, working_dir):
       # convert.decode which should only occur for the trailing blank line.
       raw_data = (
           pipeline
-          | 'ReadTrainData' >> textio.ReadFromText(train_data_file)
+          | 'ReadTrainData' >> beam.io.ReadFromText(train_data_file)
           | 'FixCommasTrainData' >> beam.Map(
               lambda line: line.replace(', ', ','))
           | 'DecodeTrainData' >> MapAndFilterErrors(converter.decode))
@@ -187,7 +195,7 @@ def transform_data(train_data_file, test_data_file, working_dir):
       # raw_data.
       raw_dataset = (raw_data, RAW_DATA_METADATA)
       transformed_dataset, transform_fn = (
-          raw_dataset | beam_impl.AnalyzeAndTransformDataset(preprocessing_fn))
+          raw_dataset | tft_beam.AnalyzeAndTransformDataset(preprocessing_fn))
       transformed_data, transformed_metadata = transformed_dataset
       transformed_data_coder = tft.coders.ExampleProtoCoder(
           transformed_metadata.schema)
@@ -195,7 +203,7 @@ def transform_data(train_data_file, test_data_file, working_dir):
       _ = (
           transformed_data
           | 'EncodeTrainData' >> beam.Map(transformed_data_coder.encode)
-          | 'WriteTrainData' >> tfrecordio.WriteToTFRecord(
+          | 'WriteTrainData' >> beam.io.WriteToTFRecord(
               os.path.join(working_dir, TRANSFORMED_TRAIN_DATA_FILEBASE)))
 
       # Now apply transform function to test data.  In this case we remove the
@@ -203,33 +211,31 @@ def transform_data(train_data_file, test_data_file, working_dir):
       # that is present in the test data file.
       raw_test_data = (
           pipeline
-          | 'ReadTestData' >> textio.ReadFromText(test_data_file,
-                                                  skip_header_lines=1)
+          | 'ReadTestData' >> beam.io.ReadFromText(test_data_file,
+                                                   skip_header_lines=1)
           | 'FixCommasTestData' >> beam.Map(
               lambda line: line.replace(', ', ','))
           | 'RemoveTrailingPeriodsTestData' >> beam.Map(lambda line: line[:-1])
-          | 'DecodeTestData' >> beam.Map(converter.decode))
+          | 'DecodeTestData' >> MapAndFilterErrors(converter.decode))
 
       raw_test_dataset = (raw_test_data, RAW_DATA_METADATA)
 
       transformed_test_dataset = (
-          (raw_test_dataset, transform_fn) | beam_impl.TransformDataset())
+          (raw_test_dataset, transform_fn) | tft_beam.TransformDataset())
       # Don't need transformed data schema, it's the same as before.
       transformed_test_data, _ = transformed_test_dataset
 
       _ = (
           transformed_test_data
           | 'EncodeTestData' >> beam.Map(transformed_data_coder.encode)
-          | 'WriteTestData' >> tfrecordio.WriteToTFRecord(
+          | 'WriteTestData' >> beam.io.WriteToTFRecord(
               os.path.join(working_dir, TRANSFORMED_TEST_DATA_FILEBASE)))
 
-      # Will write a SavedModel and metadata to two subdirectories of
-      # working_dir, given by transform_fn_io.TRANSFORM_FN_DIR and
-      # transform_fn_io.TRANSFORMED_METADATA_DIR respectively.
+      # Will write a SavedModel and metadata to working_dir, which can then
+      # be read by the tft.TFTransformOutput class.
       _ = (
           transform_fn
-          | 'WriteTransformFn' >>
-          transform_fn_io.WriteTransformFn(working_dir))
+          | 'WriteTransformFn' >> tft_beam.WriteTransformFn(working_dir))
 
 # Functions for training
 
@@ -258,6 +264,7 @@ def _make_training_input_fn(tf_transform_output, transformed_examples,
     transformed_features = dataset.make_one_shot_iterator().get_next()
 
     # Extract features and label from the transformed tensors.
+    # TODO(b/30367437): make transformed_labels a dict.
     transformed_labels = transformed_features.pop(LABEL_KEY)
 
     return transformed_features, transformed_labels
@@ -300,6 +307,30 @@ def _make_serving_input_fn(tf_transform_output):
   return serving_input_fn
 
 
+def get_feature_columns(tf_transform_output):
+  """Returns the FeatureColumns for the model.
+
+  Args:
+    tf_transform_output: A `TFTransformOutput` object.
+
+  Returns:
+    A list of FeatureColumns.
+  """
+  # Wrap scalars as real valued columns.
+  real_valued_columns = [tf.feature_column.numeric_column(key, shape=())
+                         for key in NUMERIC_FEATURE_KEYS]
+
+  # Wrap categorical columns.
+  one_hot_columns = [
+      tf.feature_column.categorical_column_with_vocabulary_file(
+          key=key,
+          vocabulary_file=tf_transform_output.vocabulary_file_by_name(
+              vocab_filename=key))
+      for key in CATEGORICAL_FEATURE_KEYS]
+
+  return real_valued_columns + one_hot_columns
+
+
 def train_and_evaluate(working_dir, num_train_instances=NUM_TRAIN_INSTANCES,
                        num_test_instances=NUM_TEST_INSTANCES):
   """Train the model on training data and evaluate on test data.
@@ -315,22 +346,10 @@ def train_and_evaluate(working_dir, num_train_instances=NUM_TRAIN_INSTANCES,
   """
   tf_transform_output = tft.TFTransformOutput(working_dir)
 
-  # Wrap scalars as real valued columns.
-  real_valued_columns = [tf.feature_column.numeric_column(key, shape=())
-                         for key in NUMERIC_FEATURE_KEYS]
-
-  # Wrap categorical columns.
-  one_hot_columns = [
-      tf.feature_column.categorical_column_with_vocabulary_file(
-          key=key,
-          vocabulary_file=tf_transform_output.vocabulary_file_by_name(
-              vocab_filename=key))
-      for key in CATEGORICAL_FEATURE_KEYS]
-
   run_config = tf.estimator.RunConfig()
 
   estimator = tf.estimator.LinearClassifier(
-      feature_columns=real_valued_columns + one_hot_columns,
+      feature_columns=get_feature_columns(tf_transform_output),
       config=run_config)
 
   # Fit the model using the default optimizer.

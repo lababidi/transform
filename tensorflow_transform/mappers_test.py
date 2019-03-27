@@ -17,15 +17,14 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+# GOOGLE-INITIALIZATION
 
 import tensorflow as tf
 from tensorflow_transform import mappers
-
-import unittest
-from tensorflow.python.framework import test_util
+from tensorflow_transform import test_case
 
 
-class MappersTest(test_util.TensorFlowTestCase):
+class MappersTest(test_case.TransformTestCase):
 
   def assertSparseOutput(self, expected_indices, expected_values,
                          expected_shape, actual_sparse_tensor, close_values):
@@ -81,12 +80,12 @@ class MappersTest(test_util.TensorFlowTestCase):
             [2, 22], [2, 23], [2, 24], [2, 25], [2, 26], [2, 27], [2, 28],
             [2, 29], [3, 0]],
         expected_values=[
-            'a', 'ab', 'abc', 'b', 'bc', 'c',
-            'd', 'de', 'def', 'e', 'ef', 'f',
-            'f', 'fg', 'fgh', 'fghi', 'fghij', 'g', 'gh', 'ghi', 'ghij',
-            'ghijk', 'h', 'hi', 'hij', 'hijk', 'hijkl', 'i', 'ij', 'ijk',
-            'ijkl', 'ijklm', 'j', 'jk', 'jkl', 'jklm', 'k', 'kl', 'klm', 'l',
-            'lm', 'm', 'z'],
+            b'a', b'ab', b'abc', b'b', b'bc', b'c', b'd', b'de', b'def', b'e',
+            b'ef', b'f', b'f', b'fg', b'fgh', b'fghi', b'fghij', b'g', b'gh',
+            b'ghi', b'ghij', b'ghijk', b'h', b'hi', b'hij', b'hijk', b'hijkl',
+            b'i', b'ij', b'ijk', b'ijkl', b'ijklm', b'j', b'jk', b'jkl',
+            b'jklm', b'k', b'kl', b'klm', b'l', b'lm', b'm', b'z'
+        ],
         expected_shape=[5, 30],
         actual_sparse_tensor=output_tensor,
         close_values=False)
@@ -106,11 +105,11 @@ class MappersTest(test_util.TensorFlowTestCase):
             [2, 8], [2, 9], [2, 10], [2, 11], [2, 12], [2, 13], [2, 14],
             [2, 15], [2, 16], [2, 17], [2, 18], [2, 19], [2, 20], [2, 21]],
         expected_values=[
-            'ab', 'abc', 'bc',
-            'de', 'def', 'ef',
-            'fg', 'fgh', 'fghi', 'fghij', 'gh', 'ghi', 'ghij', 'ghijk',
-            'hi', 'hij', 'hijk', 'hijkl', 'ij', 'ijk', 'ijkl', 'ijklm',
-            'jk', 'jkl', 'jklm', 'kl', 'klm', 'lm'],
+            b'ab', b'abc', b'bc', b'de', b'def', b'ef', b'fg', b'fgh', b'fghi',
+            b'fghij', b'gh', b'ghi', b'ghij', b'ghijk', b'hi', b'hij', b'hijk',
+            b'hijkl', b'ij', b'ijk', b'ijkl', b'ijklm', b'jk', b'jkl', b'jklm',
+            b'kl', b'klm', b'lm'
+        ],
         expected_shape=[5, 22],
         actual_sparse_tensor=output_tensor,
         close_values=False)
@@ -129,8 +128,9 @@ class MappersTest(test_util.TensorFlowTestCase):
           [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4],
            [1, 0], [1, 1], [1, 2], [1, 3], [1, 4], [1, 5], [1, 6]])
       self.assertAllEqual(output.values, [
-          'One', 'One was', 'was', 'was Johnny', 'Johnny',
-          'Two', 'Two was', 'was', 'was a', 'a', 'a rat', 'rat'])
+          b'One', b'One was', b'was', b'was Johnny', b'Johnny', b'Two',
+          b'Two was', b'was', b'was a', b'a', b'a rat', b'rat'
+      ])
       self.assertAllEqual(output.dense_shape, [2, 7])
 
   def testNGramsBadSizes(self):
@@ -238,6 +238,7 @@ class MappersTest(test_util.TensorFlowTestCase):
         close_values=True)
 
   def testSplitTFIDFWithEmptyInput(self):
+    # TODO(b/123242111): rewrite this test using public functions.
     with tf.Graph().as_default():
       tfidf = tf.SparseTensor(
           values=tf.constant([], shape=[0], dtype=tf.float32),
@@ -301,6 +302,134 @@ class MappersTest(test_util.TensorFlowTestCase):
         actual_sparse_tensor=hashed_strings,
         close_values=False)
 
+  def testLookupKey(self):
+    keys = tf.constant(['a', 'a', 'a', 'b', 'b', 'b', 'b'])
+    key_vocab = tf.constant(['a', 'b'])
+    key_indices = mappers._lookup_key(keys, key_vocab)
+    with self.test_session() as sess:
+      sess.run(tf.tables_initializer())
+      output = sess.run(key_indices)
+      self.assertAllEqual([0, 0, 0, 1, 1, 1, 1], output)
+
+  def testStackBucketBoundaries(self):
+    bucket_boundaries = tf.constant([[0, .1, .2], [.1, .2, .3]],
+                                    dtype=tf.float32)
+    combined_boundaries, offsets = mappers._combine_bucket_boundaries(
+        bucket_boundaries, epsilon=0.03)
+    with self.test_session() as sess:
+      self.assertAllClose([0, 0.1, 0.2, 0.23, 0.33, 0.43],
+                          sess.run(combined_boundaries))
+      self.assertAllClose([0, 0.13], sess.run(offsets))
+
+  def testApplyBucketsWithKeys(self):
+    values = tf.constant(
+        [-100, -0.05, 0.05, 0.25, 0.15, 100, -100, 4.3, 4.5, 4.4, 4.6, 100],
+        dtype=tf.float32)
+    keys = tf.constant(
+        ['a', 'a', 'a', 'a', 'a', 'a', 'b', 'b', 'b', 'b', 'b', 'b'])
+    key_vocab = tf.constant(['a', 'b'])
+    bucket_boundaries = tf.constant([[0, .1, .2], [4.33, 4.43, 4.53]],
+                                    dtype=tf.float32)
+    buckets = mappers._apply_buckets_with_keys(values, keys, key_vocab,
+                                               bucket_boundaries)
+    with self.test_session() as sess:
+      sess.run(tf.tables_initializer())
+      output = sess.run(buckets)
+      self.assertAllEqual([0, 0, 1, 3, 2, 3, 0, 0, 2, 1, 3, 3], output)
+
+  @test_case.named_parameters(
+      dict(
+          testcase_name='single_input_value',
+          x=1,
+          boundaries=[0, 2],
+          expected_results=.5),
+      dict(
+          testcase_name='single_boundary',
+          x=[-1, 9, 10, 11],
+          boundaries=[10],
+          expected_results=[0, 0, 1, 1]),
+      dict(
+          testcase_name='out_of_bounds',
+          x=[-1111, 0, 5, 9, 10, 11, 15, 19, 20, 21, 1111],
+          boundaries=[10, 20],
+          expected_results=[0, 0, 0, 0, 0, .1, 0.5, .9, 1, 1, 1]),
+      dict(
+          testcase_name='2d_input',
+          x=[[15, 10], [20, 17], [-1111, 21]],
+          boundaries=[10, 20],
+          expected_results=[[0.5, 0], [1, .7], [0, 1]]),
+      dict(
+          testcase_name='integer_input',
+          x=[15, 20, 25],
+          boundaries=[10, 20],
+          expected_results=[.5, 1, 1],
+          input_dtype=tf.int64),
+      dict(
+          testcase_name='float_input',
+          x=[-10, 0, 0.1, 2.3, 4.5, 6.7, 8.9, 10, 100],
+          boundaries=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+          expected_results=[0, 0, 0.01, 0.23, 0.45, 0.67, 0.89, 1, 1]),
+      dict(
+          testcase_name='integer_boundaries',
+          x=[15, 20, 25],
+          boundaries=[10, 20],
+          expected_results=[.5, 1, 1],
+          boundaries_dtype=tf.int64),
+      dict(
+          testcase_name='negative_boundaries',
+          x=[-10, -5, -3, 0, 2, 4, 8, 12, 18],
+          boundaries=[-20, -4, 1, 4, 20],
+          expected_results=[
+              0.15625, 0.234375, .3, .45, 0.583333, .75, 0.8125, .875, 0.96875
+          ]),
+      dict(
+          testcase_name='interpolates_properly',
+          x=[-1111, 10, 50, 100, 1000, 9000, 10000, 1293817391],
+          boundaries=[10, 100, 1000, 10000],
+          expected_results=[
+              0, 0, (4.0 / 9 / 3), (1.0 / 3), (2.0 / 3), ((2 + 8.0 / 9) / 3), 1,
+              1
+          ],
+          boundaries_dtype=tf.int64),
+  )
+  def testApplyBucketsWithInterpolation(self,
+                                        x,
+                                        boundaries,
+                                        expected_results,
+                                        input_dtype=tf.float32,
+                                        boundaries_dtype=tf.float32):
+    with self.test_session() as sess:
+      x = tf.constant(x, dtype=input_dtype)
+      boundaries = tf.constant([boundaries], dtype=boundaries_dtype)
+      output = mappers.apply_buckets_with_interpolation(x, boundaries)
+      self.assertAllClose(sess.run(output), expected_results, 1e-6)
+
+  def testBucketsWithInterpolationUnknownShapeBoundary(self):
+    with self.test_session() as sess:
+      x = tf.constant([0, 1, 5, 12], dtype=tf.float32)
+      # The shape used to generate the boundaries is random, and therefore
+      # the size of the boundaries tensor is not known.
+      num_boundaries = tf.random.uniform([1], 1, 2, dtype=tf.int64)[0]
+      boundaries = tf.random.uniform([1, num_boundaries], 0, 10)
+      # We don't assert anything about the outcome because we are intentionally
+      # using randomized boundaries, but we ensure the operations succeed.
+      _ = sess.run(mappers.apply_buckets_with_interpolation(x, boundaries))
+
+  def testBucketsWithInterpolationUnsortedBoundaries(self):
+    with self.test_session() as sess:
+      x = tf.constant([1, 2, 3, 5], dtype=tf.float32)
+      boundaries = tf.constant([[4, 2]], dtype=tf.float32)
+      output = mappers.apply_buckets_with_interpolation(x, boundaries)
+      # Boundaries must be sorted, so an exception is raised.
+      with self.assertRaises(tf.errors.InvalidArgumentError):
+        sess.run(output)
+
+  def testSparseTensorToDenseWithShape(self):
+    with tf.Graph().as_default():
+      sparse = tf.sparse_placeholder(tf.int64, shape=[None, None])
+      dense = mappers.sparse_tensor_to_dense_with_shape(sparse, [None, 5])
+      self.assertAllEqual(dense.get_shape().as_list(), [None, 5])
+
 
 if __name__ == '__main__':
-  unittest.main()
+  test_case.main()

@@ -20,10 +20,11 @@ from __future__ import print_function
 import pprint
 import tempfile
 
+# GOOGLE-INITIALIZATION
 
 import tensorflow as tf
 import tensorflow_transform as tft
-import tensorflow_transform.beam.impl as beam_impl
+import tensorflow_transform.beam.impl as tft_beam
 from tensorflow_transform.tf_metadata import dataset_metadata
 from tensorflow_transform.tf_metadata import dataset_schema
 
@@ -51,18 +52,16 @@ def main():
       {'x': 3, 'y': 3, 's': 'hello'}
   ]
 
-  raw_data_metadata = dataset_metadata.DatasetMetadata(dataset_schema.Schema({
-      's': dataset_schema.ColumnSchema(
-          tf.string, [], dataset_schema.FixedColumnRepresentation()),
-      'y': dataset_schema.ColumnSchema(
-          tf.float32, [], dataset_schema.FixedColumnRepresentation()),
-      'x': dataset_schema.ColumnSchema(
-          tf.float32, [], dataset_schema.FixedColumnRepresentation())
-  }))
+  raw_data_metadata = dataset_metadata.DatasetMetadata(
+      dataset_schema.from_feature_spec({
+          's': tf.FixedLenFeature([], tf.string),
+          'y': tf.FixedLenFeature([], tf.float32),
+          'x': tf.FixedLenFeature([], tf.float32),
+      }))
 
-  with beam_impl.Context(temp_dir=tempfile.mkdtemp()):
+  with tft_beam.Context(temp_dir=tempfile.mkdtemp()):
     transformed_dataset, transform_fn = (  # pylint: disable=unused-variable
-        (raw_data, raw_data_metadata) | beam_impl.AnalyzeAndTransformDataset(
+        (raw_data, raw_data_metadata) | tft_beam.AnalyzeAndTransformDataset(
             preprocessing_fn))
 
   transformed_data, transformed_metadata = transformed_dataset  # pylint: disable=unused-variable

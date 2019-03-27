@@ -21,52 +21,50 @@ import json
 import os
 import tempfile
 
+# GOOGLE-INITIALIZATION
 
 import six
 import tensorflow as tf
 
+from tensorflow_transform import test_case
 from tensorflow_transform.saved import input_fn_maker
 from tensorflow_transform.saved import saved_transform_io
 from tensorflow_transform.tf_metadata import dataset_metadata
-from tensorflow_transform.tf_metadata import dataset_schema as sch
-import unittest
 
 
-def _make_raw_schema(shape, should_add_unused_feature=False):
-  schema = sch.Schema()
+class _MockSchema(object):
+  """Mock object that allows feature specs not allowed by the actual Schema."""
 
-  schema.column_schemas['raw_a'] = (sch.ColumnSchema(
-      tf.int64, shape, sch.FixedColumnRepresentation(default_value=0)))
+  def __init__(self, feature_spec):
+    self._feature_spec = feature_spec
 
-  schema.column_schemas['raw_b'] = (sch.ColumnSchema(
-      tf.int64, shape, sch.FixedColumnRepresentation(default_value=1)))
+  def as_feature_spec(self):
+    return self._feature_spec
 
-  schema.column_schemas['raw_label'] = (sch.ColumnSchema(
-      tf.int64, shape, sch.FixedColumnRepresentation(default_value=-1)))
 
+def _make_raw_schema(
+    shape=None,
+    should_add_unused_feature=False):
+  feature_spec = {
+      'raw_a': tf.FixedLenFeature(shape, tf.int64, 0),
+      'raw_b': tf.FixedLenFeature(shape, tf.int64, 1),
+      'raw_label': tf.FixedLenFeature(shape, tf.int64, -1),
+  }
   if should_add_unused_feature:
-    schema.column_schemas['raw_unused'] = (sch.ColumnSchema(
-        tf.int64, shape, sch.FixedColumnRepresentation(default_value=1)))
-
-  return schema
+    feature_spec['raw_unused'] = tf.FixedLenFeature(shape, tf.int64, 1)
+  return _MockSchema(feature_spec=feature_spec)
 
 
 def _make_transformed_schema(shape):
-  schema = sch.Schema()
-
-  schema.column_schemas['transformed_a'] = (
-      sch.ColumnSchema(tf.int64, shape, sch.FixedColumnRepresentation()))
-
-  schema.column_schemas['transformed_b'] = (
-      sch.ColumnSchema(tf.int64, shape, sch.ListColumnRepresentation()))
-
-  schema.column_schemas['transformed_label'] = (
-      sch.ColumnSchema(tf.int64, shape, sch.FixedColumnRepresentation()))
-
-  return schema
+  feature_spec = {
+      'transformed_a': tf.FixedLenFeature(shape, tf.int64),
+      'transformed_b': tf.VarLenFeature(tf.int64),
+      'transformed_label': tf.FixedLenFeature(shape, tf.int64),
+  }
+  return _MockSchema(feature_spec=feature_spec)
 
 
-class InputFnMakerTest(unittest.TestCase):
+class InputFnMakerTest(test_case.TransformTestCase):
 
   def test_build_csv_transforming_serving_input_fn_with_defaults(self):
     feed_dict = [',,']
@@ -88,7 +86,7 @@ class InputFnMakerTest(unittest.TestCase):
       with tf.Session().as_default() as session:
         outputs, labels, inputs = serving_input_fn()
 
-        self.assertItemsEqual(
+        self.assertCountEqual(
             outputs.keys(),
             {'transformed_a', 'transformed_b', 'transformed_label'})
         self.assertIsNone(labels)
@@ -136,7 +134,7 @@ class InputFnMakerTest(unittest.TestCase):
       with tf.Session().as_default() as session:
         outputs, labels, inputs = serving_input_fn()
 
-        self.assertItemsEqual(
+        self.assertCountEqual(
             outputs.keys(),
             {'transformed_a', 'transformed_b', 'transformed_label'})
         self.assertIsNone(labels)
@@ -221,7 +219,7 @@ class InputFnMakerTest(unittest.TestCase):
       with tf.Session().as_default() as session:
         outputs, labels, inputs = serving_input_fn()
 
-        self.assertItemsEqual(
+        self.assertCountEqual(
             outputs.keys(),
             {'transformed_a', 'transformed_b', 'transformed_label'})
         self.assertIsNone(labels)
@@ -265,6 +263,7 @@ class InputFnMakerTest(unittest.TestCase):
     self._test_build_parsing_transforming_serving_input_fn_with_label([1])
 
   def _test_build_parsing_transforming_serving_input_fn_with_label(self, shape):
+    # TODO(b/123241798): use TEST_TMPDIR
     basedir = tempfile.mkdtemp()
 
     raw_metadata = dataset_metadata.DatasetMetadata(
@@ -290,7 +289,7 @@ class InputFnMakerTest(unittest.TestCase):
       with tf.Session().as_default() as session:
         outputs, labels, inputs = serving_input_fn()
 
-        self.assertItemsEqual(
+        self.assertCountEqual(
             set(outputs.keys()),
             {'transformed_a', 'transformed_b', 'transformed_label'})
         self.assertEqual(labels, None)
@@ -328,6 +327,7 @@ class InputFnMakerTest(unittest.TestCase):
     self.assertEqual(2000, transformed_label[1][0])
 
   def _test_build_parsing_transforming_serving_input_fn(self, shape):
+    # TODO(b/123241798): use TEST_TMPDIR
     basedir = tempfile.mkdtemp()
 
     raw_metadata = dataset_metadata.DatasetMetadata(
@@ -354,7 +354,7 @@ class InputFnMakerTest(unittest.TestCase):
       with tf.Session().as_default() as session:
         outputs, labels, inputs = serving_input_fn()
 
-        self.assertItemsEqual(
+        self.assertCountEqual(
             set(outputs.keys()),
             {'transformed_a', 'transformed_b', 'transformed_label'})
         self.assertEqual(labels, None)
@@ -405,6 +405,7 @@ class InputFnMakerTest(unittest.TestCase):
 
   def _test_build_default_transforming_serving_input_fn_with_label(
       self, shape, feed_input_values):
+    # TODO(b/123241798): use TEST_TMPDIR
     basedir = tempfile.mkdtemp()
 
     raw_metadata = dataset_metadata.DatasetMetadata(
@@ -425,7 +426,7 @@ class InputFnMakerTest(unittest.TestCase):
       with tf.Session().as_default() as session:
         outputs, labels, inputs = serving_input_fn()
 
-        self.assertItemsEqual(
+        self.assertCountEqual(
             set(outputs.keys()),
             {'transformed_a', 'transformed_b', 'transformed_label'})
         self.assertEqual(labels, None)
@@ -467,6 +468,7 @@ class InputFnMakerTest(unittest.TestCase):
 
   def _test_build_default_transforming_serving_input_fn(
       self, shape, feed_input_values):
+    # TODO(b/123241798): use TEST_TMPDIR
     basedir = tempfile.mkdtemp()
 
     raw_metadata = dataset_metadata.DatasetMetadata(
@@ -488,7 +490,7 @@ class InputFnMakerTest(unittest.TestCase):
       with tf.Session().as_default() as session:
         outputs, labels, inputs = serving_input_fn()
 
-        self.assertItemsEqual(
+        self.assertCountEqual(
             set(outputs.keys()),
             {'transformed_a', 'transformed_b', 'transformed_label'})
         self.assertEqual(labels, None)
@@ -526,6 +528,7 @@ class InputFnMakerTest(unittest.TestCase):
     self.assertEqual(-5, transformed_b_dict[(1, 0)])
 
   def test_build_training_input_fn(self):
+    # TODO(b/123241798): use TEST_TMPDIR
     basedir = tempfile.mkdtemp()
 
     # the transformed schema should be vectorized already.
@@ -582,6 +585,7 @@ class InputFnMakerTest(unittest.TestCase):
     self._test_build_transforming_training_input_fn([1])
 
   def _test_build_transforming_training_input_fn(self, shape):
+    # TODO(b/123241798): use TEST_TMPDIR
     basedir = tempfile.mkdtemp()
 
     raw_metadata = dataset_metadata.DatasetMetadata(
@@ -710,4 +714,4 @@ def _write_transform_savedmodel(transform_savedmodel_dir,
           session, inputs, outputs, transform_savedmodel_dir)
 
 if __name__ == '__main__':
-  unittest.main()
+  test_case.main()

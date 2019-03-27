@@ -18,57 +18,74 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import collections
 import itertools
 
+# GOOGLE-INITIALIZATION
 
 import numpy as np
 import six
+from six.moves import queue  # pylint: disable=redefined-builtin
 from six.moves import range  # pylint: disable=redefined-builtin
 from six.moves import zip  # pylint: disable=redefined-builtin
 import tensorflow as tf
-from tensorflow_transform import analyzers
-from tensorflow_transform import api
-from tensorflow_transform.tf_metadata import dataset_schema
 
-_EMPTY_ARRAY = np.array([])
-_EMPTY_ARRAY.setflags(write=False)
+_CACHED_EMPTY_ARRAY_BY_DTYPE = {}
 
 
-def infer_feature_schema(tensors):
-  """Given a dict of tensors, creates a `Schema`.
+def _get_empty_array(dtype):
+  if dtype not in _CACHED_EMPTY_ARRAY_BY_DTYPE:
+    empty_array = np.array([], dtype)
+    empty_array.setflags(write=False)
+    _CACHED_EMPTY_ARRAY_BY_DTYPE[dtype] = empty_array
+  return _CACHED_EMPTY_ARRAY_BY_DTYPE[dtype]
 
-  Infers a schema, in the format of a tf.Transform `Schema`, for the given
-  dictionary of tensors.
+
+def feature_spec_as_batched_placeholders(feature_spec):
+  """Returns placeholders for the given feature spec.
+
+  Returns a dictionary of placeholders with the same type and shape as calling
+  tf.parse_example with the given feature spec.
 
   Args:
-    tensors: A dict mapping column names to tensors. The tensors should have a
-      0'th dimension interpreted as the batch dimension.
+    feature_spec: A TensorFlow feature spec.
 
   Returns:
-    A `Schema` object.
+    A dictionary from strings to `Tensor` or `SparseTensor`s.
+
+  Raises:
+    ValueError: If the feature spec contains feature types not supported.
   """
-  return dataset_schema.Schema({
-      name: dataset_schema.infer_column_schema_from_tensor(tensor)
-      for name, tensor in six.iteritems(tensors)
-  })
+  result = {}
+  for name, spec in six.iteritems(feature_spec):
+    if spec.dtype not in (tf.int64, tf.float32, tf.string):
+      raise ValueError('{} had invalid dtype'.format(spec))
+    if isinstance(spec, tf.FixedLenFeature):
+      result[name] = tf.placeholder(spec.dtype, [None] + spec.shape, name=name)
+    elif isinstance(spec, tf.VarLenFeature):
+      result[name] = tf.sparse_placeholder(spec.dtype, [None, None], name=name)
+    elif isinstance(spec, tf.SparseFeature):
+      result[name] = tf.sparse_placeholder(spec.dtype, [None, spec.size],
+                                           name=name)
+    else:
+      raise TypeError('Feature spec {} of type {} is not supported'.format(
+          spec, type(spec)))
+  return result
 
 
-def make_feed_dict(input_tensors, schema, instances):
-  """Creates a feed dict for passing data to the graph.
+def make_feed_list(column_names, schema, instances):
+  """Creates a feed list for passing data to the graph.
 
   Converts a list of instances in the in-memory representation to a batch
   suitable for passing to `tf.Session.run`.
 
   Args:
-    input_tensors: A map from column names to `Tensor`s or `SparseTensor`s.
+    column_names: A list of column names.
     schema: A `Schema` object.
     instances: A list of instances, each of which is a map from column name to a
       python primitive, list, or ndarray.
 
   Returns:
-    A map from `Tensor`s or `SparseTensor`s to batches in the format required by
-    `tf.Session.run`.
+    A list of batches in the format required by a tf `Callable`.
 
   Raises:
     ValueError: If `schema` is invalid.
@@ -116,32 +133,37 @@ def make_feed_dict(input_tensors, schema, instances):
     batch_shape = (len(instance_indices), max_index)
     return tf.SparseTensorValue(batch_indices, batch_values, batch_shape)
 
-  result = {}
-  for key, input_tensor in six.iteritems(input_tensors):
-    representation = schema.column_schemas[key].representation
-    if isinstance(representation, dataset_schema.FixedColumnRepresentation):
-      feed_value = [instance[key] for instance in instances]
+  result = []
+  feature_spec = schema.as_feature_spec()
+  for name in column_names:
+    spec = feature_spec[name]
+    # TODO(abrao): Validate dtypes, shapes etc.
+    if isinstance(spec, tf.FixedLenFeature):
+      feed_value = [instance[name] for instance in instances]
 
-    elif isinstance(representation, dataset_schema.ListColumnRepresentation):
-      values = [instance[key] for instance in instances]
-      indices = [range(len(instance[key])) for instance in instances]
-      max_index = max([len(instance[key]) for instance in instances])
+    elif isinstance(spec, tf.VarLenFeature):
+      values = [[] if instance[name] is None else instance[name]
+                for instance in instances]
+      indices = [range(len(value)) for value in values]
+      max_index = max([len(value) for value in values])
       feed_value = make_sparse_batch(indices, values, max_index)
 
-    elif isinstance(representation, dataset_schema.SparseColumnRepresentation):
-      max_index = schema.column_schemas[key].axes[0].size
+    elif isinstance(spec, tf.SparseFeature):
+      # TODO(KesterTong): Add support for N-d SparseFeatures.
+      max_index = spec.size
       indices, values = [], []
       for instance in instances:
-        instance_indices, instance_values = instance[key]
+        instance_indices = instance[spec.index_key]
+        instance_values = instance[spec.value_key]
         check_valid_sparse_tensor(
-            instance_indices, instance_values, max_index, key)
+            instance_indices, instance_values, max_index, name)
         indices.append(instance_indices)
         values.append(instance_values)
       feed_value = make_sparse_batch(indices, values, max_index)
 
     else:
-      raise ValueError('Invalid column {}.'.format(schema.column_schemas[key]))
-    result[input_tensor] = feed_value
+      raise ValueError('Invalid feature spec {}.'.format(spec))
+    result.append(feed_value)
 
   return result
 
@@ -179,10 +201,10 @@ def to_instance_dicts(schema, fetches):
     """
     batch_indices, batch_values, batch_shape = sparse_value
     # Preallocate lists of length batch_size, initialized to empty ndarrays,
-    # representing the indices and values of instances. We can reuse
-    # _EMPTY_ARRAY here because it is immutable.
-    instance_indices = [_EMPTY_ARRAY] * batch_shape[0]
-    instance_values = [_EMPTY_ARRAY] * batch_shape[0]
+    # representing the indices and values of instances. We can reuse the return
+    # value of _get_empty_array here because it is immutable.
+    instance_indices = [_get_empty_array(batch_indices.dtype)] * batch_shape[0]
+    instance_values = [_get_empty_array(batch_values.dtype)] * batch_shape[0]
     instance_rank = len(batch_shape[1:])
 
     # Iterate over the rows in the batch. At each row, consume all the elements
@@ -206,7 +228,8 @@ def to_instance_dicts(schema, fetches):
               batch_indices[current_offset]))
 
       if current_offset == start_offset:
-        # If the current row is empty, leave the default value, _EMPTY_ARRAY.
+        # If the current row is empty, leave the default value, which is an
+        # empty array.
         pass
       else:
         instance_indices[current_row] = batch_indices[
@@ -222,13 +245,14 @@ def to_instance_dicts(schema, fetches):
 
   batch_dict = {}
   batch_sizes = {}
-  for key, value in six.iteritems(fetches):
-    representation = schema.column_schemas[key].representation
-    if isinstance(representation, dataset_schema.FixedColumnRepresentation):
-      batch_dict[key] = [value[i] for i in range(value.shape[0])]
-      batch_sizes[key] = value.shape[0]
+  feature_spec = schema.as_feature_spec()
+  for name, value in six.iteritems(fetches):
+    spec = feature_spec[name]
+    if isinstance(spec, tf.FixedLenFeature):
+      batch_dict[name] = [value[i] for i in range(value.shape[0])]
+      batch_sizes[name] = value.shape[0]
 
-    elif isinstance(representation, dataset_schema.ListColumnRepresentation):
+    elif isinstance(spec, tf.VarLenFeature):
       if not isinstance(value, tf.SparseTensorValue):
         raise ValueError(
             'Expected a SparseTensorValue, but got {}'.format(value))
@@ -237,30 +261,32 @@ def to_instance_dicts(schema, fetches):
         if len(indices.shape) > 1 or np.any(indices != np.arange(len(indices))):
           raise ValueError('Encountered a SparseTensorValue that cannot be '
                            'decoded by ListColumnRepresentation.')
-      batch_dict[key] = instance_values
-      batch_sizes[key] = len(instance_values)
+      batch_dict[name] = instance_values
+      batch_sizes[name] = len(instance_values)
 
-    elif isinstance(representation, dataset_schema.SparseColumnRepresentation):
+    elif isinstance(spec, tf.SparseFeature):
       if not isinstance(value, tf.SparseTensorValue):
         raise ValueError(
             'Expected a SparseTensorValue, but got {}'.format(value))
+      # TODO(abrao): Add support for N-d SparseFeatures.
       instance_indices, instance_values = decompose_sparse_batch(value)
-      batch_dict[key] = zip(instance_indices, instance_values)
-      batch_sizes[key] = len(instance_values)
+      batch_dict[spec.index_key] = instance_indices
+      batch_dict[spec.value_key] = instance_values
+      batch_sizes[name] = len(instance_values)
 
     else:
-      raise ValueError(
-          'Unhandled column representation: {}.'.format(representation))
+      raise ValueError('Invalid feature spec {}.'.format(spec))
 
   # Check batch size is the same for each output.  Note this assumes that
   # fetches is not empty.
-  batch_size = batch_sizes.values()[0]
+  batch_size = next(six.itervalues(batch_sizes))
   for name, batch_size_for_name in six.iteritems(batch_sizes):
     if batch_size_for_name != batch_size:
       raise ValueError(
           'Inconsistent batch sizes: "{}" had batch dimension {}, "{}" had'
-          ' batch dimension {}'.format(
-              name, batch_size_for_name, batch_sizes.keys()[0], batch_size))
+          ' batch dimension {}'.format(name, batch_size_for_name,
+                                       next(six.iterkeys(batch_sizes)),
+                                       batch_size))
 
   # The following is the simplest way to convert batch_dict from a dict of
   # iterables to a list of dicts.  It does this by first extracting the values
@@ -270,6 +296,7 @@ def to_instance_dicts(schema, fetches):
           for instance_values in zip(*six.itervalues(batch_dict))]
 
 
+# TODO(b/36040669): Consider moving this to where it can be shared with coders.
 def check_valid_sparse_tensor(indices, values, size, name):
   # Check that all indices are in range.
   if len(indices):  # pylint: disable=g-explicit-length-test
@@ -284,167 +311,6 @@ def check_valid_sparse_tensor(indices, values, size, name):
     raise ValueError(
         'Sparse column {} has indices and values of different lengths: '
         'values: {}, indices: {}'.format(name, values, indices))
-
-
-# Named tuple with details for each output of an Analyzer.
-AnalyzerOutputInfo = collections.namedtuple(
-    'AnalyzerOutputInfo', ['name', 'is_asset'])
-
-
-AnalyzerInfo = collections.namedtuple(
-    'AnalyzerInfo',
-    ['name', 'input_tensor_names', 'spec', 'output_infos'])
-
-
-Phase = collections.namedtuple(
-    'Phase', ['analyzer_infos', 'table_initializers'])
-
-
-def create_phases():
-  """Returns a list of `Phase`s describing how to execute the pipeline.
-
-  The default graph is assumed to contain some `Analyzer`s which must be
-  executed by doing a full pass over the dataset, and passing the inputs for
-  that analyzer into some implementation, then taking the results and replacing
-  the `Analyzer`s outputs with constants in the graph containing these results.
-
-  The execution plan is described by a list of `Phase`s.  Each phase contains
-  a list of `Analyzer`s, which are the `Analyzer`s which are ready to run in
-  that phase, together with a list of ops, which are the table initializers that
-  are ready to run in that phase.
-
-  An `Analyzer` or op is ready to run when all its dependencies in the graph
-  have been computed.  Thus if the graph is constructed by
-
-  def preprocessing_fn(input)
-    x = inputs['x']
-    scaled_0 = x - tft.min(x)
-    scaled_0_1 = scaled_0 / tft.max(scaled_0)
-
-  Then the first phase will contain the analyzer corresponding to the call to
-  `min`, because `x` is an input and so is ready to compute in the first phase,
-  while the second phase will contain the analyzer corresponding to the call to
-  `max` since `scaled_1` depends on the result of the call to `tft.min` which
-  is computed in the first phase.
-
-  More generally, we define a level for each op and each `Analyzer` by walking
-  the graph, assigning to each operation the max level of its inputs, to each
-  `Tensor` the level of its operation, unless it's the output of an `Analyzer`
-  in which case we assign the level of its `Analyzer` plus one.
-
-  The above description omits the role of `FunctionApplication`s.  A
-  `FunctionApplication` is a hint to create_phases about the control flow of the
-  graph.  Because control flow ops can introduce circular dependencies (and
-  other circumstances such as mutable reference introduce similar problems) we
-  allow users to construct a `FunctionApplication` which is a hint that the
-  outputs `Tensor`s depend only on the input `Tensor`s.  `FunctionApplication`s
-  are also needed to collect table initializers to determine which phase a table
-  initializer is ready to run in.
-
-  Returns:
-    A list of `Phase`s.
-
-  Raises:
-    ValueError: if the graph cannot be analyzed.
-  """
-  # Construct map from tensor to generalized parent op.  We start with the map
-  # from each tensor to the `Operation` producing it, then override any `Tensor`
-  # that is the output of a `Analyzer` or `FunctionApplication` to point to that
-  # `Analyzer` or `FunctionApplication`.
-  parent_op_map = {}
-  for op in (tf.get_default_graph().get_operations() +
-             tf.get_collection(api.FUNCTION_APPLICATION_COLLECTION) +
-             tf.get_collection(analyzers.ANALYZER_COLLECTION)):
-    for tensor in op.outputs:
-      parent_op_map[tensor] = op
-
-  def _tensor_level(tensor):
-    parent_op = parent_op_map[tensor]
-    if isinstance(parent_op, analyzers.Analyzer):
-      return _generalized_op_level(parent_op) + 1
-    else:
-      return _generalized_op_level(parent_op)
-
-  memoized_levels = {}
-  stack = []
-  def _generalized_op_level(op):
-    """Get the level of a tf.Operation, FunctionApplication or Analyzer."""
-    if op not in memoized_levels:
-      if op in stack:
-        # Append op to stack so cycle appears in error message.
-        stack.append(op)
-        raise ValueError(
-            'Cycle detected: {}.  Cycles may arise by failing to call '
-            'apply_function when calling a function that internally uses '
-            'tables or control flow ops.'.format(stack))
-      stack.append(op)
-      inputs = list(op.inputs) + list(op.control_inputs)
-      memoized_levels[op] = max(
-          [_tensor_level(input_tensor) for input_tensor in inputs] + [0])
-      assert op == stack.pop()
-    return memoized_levels[op]
-
-  analyzers_by_level = collections.defaultdict(list)
-  for analyzer in tf.get_collection(analyzers.ANALYZER_COLLECTION):
-    analyzers_by_level[_generalized_op_level(analyzer)].append(analyzer)
-
-  table_initializers_by_level = collections.defaultdict(list)
-  all_table_initializers = set()
-  for m in tf.get_collection(api.FUNCTION_APPLICATION_COLLECTION):
-    table_initializers_by_level[_generalized_op_level(m)].extend(
-        m.table_initializers)
-    all_table_initializers.update(m.table_initializers)
-  expected_table_initializers = set(
-      tf.get_collection(tf.GraphKeys.TABLE_INITIALIZERS))
-  if expected_table_initializers - all_table_initializers:
-    raise ValueError(
-        'Found table initializers ({}) that were not associated with any '
-        'FunctionApplication.  Use tft.apply_function to wrap any code '
-        'that generates tables.'.format(
-            expected_table_initializers - all_table_initializers))
-  if all_table_initializers - expected_table_initializers:
-    raise ValueError(
-        'The operations ({}) were registered as table initializers during '
-        'a call to apply_function, but were not in the TABLE_INITIALIZERS '
-        'collection.  This may be a bug in tf.Transform, or you may have '
-        'cleared or altered this collection'.format(
-            all_table_initializers - expected_table_initializers))
-
-  # Construct `AnalyzerInfo`s, removing any tensors that are analyzer outputs
-  # from the ASSET_FILEPATHS collection.  These tensors will be replaced and
-  # the replacements will be added to the ASSET_FILEPATHS.  Setting
-  # AnalyzerOutputInfo.is_asset instructs the implementation to do this.
-  num_levels = len(analyzers_by_level)
-  assert len(table_initializers_by_level) <= num_levels + 1
-  asset_filepaths_collection = tf.get_collection_ref(
-      tf.GraphKeys.ASSET_FILEPATHS)
-  asset_filepaths_set = set(asset_filepaths_collection)
-  result = []
-  for level in range(num_levels):
-    # For each level, collect the analyzers in this level into a `Phase`.  Note
-    # that by construction each level should have at least one analyzer, hence
-    # the assertion below.
-    assert level in analyzers_by_level
-    analyzer_infos = []
-    for analyzer in analyzers_by_level[level]:
-      # For each analyzer in the level, construct an `AnalyzerInfo` representing
-      # the information needed to run the analyzer and insert its output back
-      # into the graph. We remove outputs from ASSET_FILEPATHS collection since
-      # outputs of an analyzer are placeholders.  If the placeholder is in the
-      # ASSET_FILEPATHS collection then we set is_asset to True which will
-      # result in the replacement being added to the ASSET_FILEPATHS collection.
-      input_tensor_names = [tensor.name for tensor in analyzer.inputs]
-      output_infos = [
-          AnalyzerOutputInfo(tensor.name, tensor in asset_filepaths_set)
-          for tensor in analyzer.outputs]
-      asset_filepaths_set.difference_update(analyzer.outputs)
-      analyzer_infos.append(AnalyzerInfo(
-          analyzer.name, input_tensor_names, analyzer.spec, output_infos))
-    result.append(Phase(analyzer_infos, table_initializers_by_level[level]))
-
-  del asset_filepaths_collection[:]
-  asset_filepaths_collection.extend(asset_filepaths_set)
-  return result
 
 
 def copy_tensors(tensors):
@@ -476,3 +342,70 @@ def _copy_tensor_or_sparse_tensor(tensor):
     dense_shape = _copy_tensor(tensor.dense_shape)
     return tf.SparseTensor(indices, values, dense_shape)
   return _copy_tensor(tensor)
+
+
+def _find_input_placeholder_ops(output_tensors):
+  """Find all the placeholder ops that (transitively) produce output_tensors."""
+  result = set()
+  enqueued_tensors = set()
+  visit_queue = queue.Queue()
+  for output_tensor in output_tensors:
+    visit_queue.put(output_tensor)
+    enqueued_tensors.add(output_tensor)
+  while not visit_queue.empty():
+    tensor = visit_queue.get()
+    ops = []
+    if isinstance(tensor, tf.Tensor):
+      ops.append(tensor.op)
+    elif isinstance(tensor, tf.SparseTensor):
+      ops.append(tensor.dense_shape.op)
+      ops.append(tensor.indices.op)
+      ops.append(tensor.values.op)
+    else:
+      raise ValueError('Unsupported Tensor type: {}'.format(type(tensor)))
+
+    for op in ops:
+      if op.type == 'Placeholder':  # no inputs and is a Placeholder op.
+        result.add(op)
+        if op.inputs:
+          raise ValueError('Placeholder op {} has non-zero inputs'.format(
+              op.name))
+      for t in op.inputs:
+        if t not in enqueued_tensors:
+          visit_queue.put(t)
+          enqueued_tensors.add(t)
+  return result
+
+
+def filter_input_tensors(input_tensors, output_tensors):
+  """Returns tensors in input_tensors that (transitively) produce output_tensors.
+
+  Args:
+    input_tensors: A dict of logical name to `tf.Tensor` or `tf.SparseTensor`.
+      Logical name doesn't have any implications in this method and can be
+      anything. In some cases it is the feature name corresponding to the input
+      tensor.
+    output_tensors: A list of `tf.Tensor` or `tf.SparseTensor`.
+
+  Returns:
+    A dict of logical name to `tf.Tensor` or `tf.SparseTensor` that are
+    filtered from input_tensors (transitively) producing output_tensors
+
+  Raises:
+    ValueError: If any Placeholder op is found to have non-zero inputs.
+  """
+  input_placeholder_ops = _find_input_placeholder_ops(output_tensors)
+
+  result = {}
+  for name, input_tensor in input_tensors.items():
+    if isinstance(input_tensor, tf.Tensor):
+      if input_tensor.op in input_placeholder_ops:
+        result[name] = input_tensor
+    elif isinstance(input_tensor, tf.SparseTensor):
+      if (input_tensor.dense_shape.op in input_placeholder_ops or
+          input_tensor.indices.op in input_placeholder_ops or
+          input_tensor.values.op in input_placeholder_ops):
+        result[name] = input_tensor
+    else:
+      raise ValueError('Unsupported Tensor type: {}'.format(type(input_tensor)))
+  return result

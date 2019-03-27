@@ -1,4 +1,212 @@
+<!-- mdformat off(mdformat causes unwanted indentation changes) -->
 # Current version (not yet released; still in development)
+
+## Major Features and Improvements
+
+## Bug Fixes and Other Changes
+* `sparse_tensor_to_dense_with_shape` now accepts an optional `default_value`
+  parameter.
+* `tft.vocabulary` and `tft.compute_and_apply_vocabulary` now support
+  `fingerprint_shuffle` to sort the vocabularies by fingerprint instead of
+  counts. This is useful for load balancing the training parameter servers.
+  This is an experimental feature.
+* Fix numerical instability in `tft.vocabulary` mutual information calculations
+* `tft.vocabulary` and `tft.compute_and_apply_vocabulary` now support computing
+  vocabularies over integer categoricals
+* New numeric normalization method available:
+  `tft.apply_buckets_with_interpolation`
+
+## Breaking changes
+
+## Deprecations
+
+# Release 0.13.0
+
+## Major Features and Improvements
+* Now `AnalyzeDataset`, `TransformDataset` and `AnalyzeAndTransformDataset` can
+  accept input data that only contains columns needed for that operation as
+  opposed to all columns defined in schema. Utility methods to infer the list of
+  needed columns are added to `tft.inspect_preprocessing_fn`. This makes it
+  easier to take advantage of columnar projection when data is stored in
+  columnar storage formats.
+* Python 3.5 is supported.
+
+## Bug Fixes and Other Changes
+* Version is now accessible as `tensorflow_transform.__version__`.
+* Depends on `apache-beam[gcp]>=2.11,<3`.
+* Depends on `protobuf>=3.7,<4`.
+
+## Breaking changes
+* Coders now return index and value features rather than a combined feature for
+  `SparseFeature`.
+* Requires pre-installed TensorFlow >=1.13,<2.
+
+## Deprecations
+
+# Release 0.12.0
+
+## Major Features and Improvements
+* Python 3.5 readiness complete (all tests pass). Full Python 3.5 compatibility
+  is expected to be available with the next version of Transform (after
+  Apache Beam 2.11 is released).
+* Performance improvements for vocabulary generation when using top_k.
+* New optimized highly experimental API for analyzing a dataset was added,
+  `AnalyzeDatasetWithCache`, which allows reading and writing analyzer cache.
+* Update `DatasetMetadata` to be a wrapper around the
+  `tensorflow_metadata.proto.v0.schema_pb2.Schema` proto.  TensorFlow Metadata
+  will be the schema used to define data parsing across TFX.  The serialized
+  `DatasetMetadata` is now the `Schema` proto in ascii format, but the previous
+  format can still be read.
+* Change `ApplySavedModel` implementation to use `tf.Session.make_callable`
+  instead of `tf.Session.run` for improved performance.
+
+## Bug Fixes and Other Changes
+
+* `tft.vocabulary` and `tft.compute_and_apply_vocabulary` now support
+  filtering based on adjusted mutual information when
+  `use_adjusetd_mutual_info` is set to True.
+* `tft.vocabulary` and `tft.compute_and_apply_vocabulary` now takes
+  regularization term 'min_diff_from_avg' that adjusts mutual information to
+  zero whenever the difference between count of the feature with any label and
+  its expected count is lower than the threshold.
+* Added an option to `tft.vocabulary` and `tft.compute_and_apply_vocabulary`
+  to compute a coverage vocabulary, using the new `coverage_top_k`,
+  `coverage_frequency_threshold` and `key_fn` parameters.
+* Added `tft.ptransform_analyzer` for advanced use cases.
+* Modified `QuantilesCombiner` to use `tf.Session.make_callable` instead of
+  `tf.Session.run` for improved performance.
+* ExampleProtoCoder now also supports non-serialized Example representations.
+* `tft.tfidf` now accepts a scalar Tensor as `vocab_size`.
+* `assertItemsEqual` in unit tests are replaced by `assertCountEqual`.
+* `NumPyCombiner` now outputs TF dtypes in output_tensor_infos instead of
+  numpy dtypes.
+* Adds function `tft.apply_pyfunc` that provides limited support for
+  `tf.pyfunc`. Note that this is incompatible with serving. See documentation
+  for more details.
+* `CombinePerKey` now adds a dimension for the key.
+* Depends on `numpy>=1.14.5,<2`.
+* Depends on `apache-beam[gcp]>=2.10,<3`.
+* Depends on `protobuf==3.7.0rc2`.
+* `ExampleProtoCoder.encode` now converts a feature whose value is `None` to an
+  empty value, where before it did not accept `None` as a valid value.
+* `AnalyzeDataset`, `AnalyzeAndTransformDataset` and `TransformDataset` can now
+  accept dictionaries which contain `None`, and which will be interpreted the
+  same as an empty list.  They will never produce an output containing `None`.
+
+## Breaking changes
+* `ColumnSchema` and related classes (`Domain`, `Axis` and
+  `ColumnRepresentation` and their subclasses) have been removed.  In order to
+  create a schema, use `from_feature_spec`.  In order to inspect a schema
+  use the `as_feature_spec` and `domains` methods of `Schema`.  The
+  constructors of these classes are replaced by functions that still work when
+  creating a `Schema` but this usage is deprecated.
+* Requires pre-installed TensorFlow >=1.12,<2.
+* `ExampleProtoCoder.decode` now converts a feature with empty value (e.g.
+  `features { feature { key: "varlen" value { } } }`) or missing key for a
+  feature (e.g. `features { }`) to a `None` in the output dictionary.  Before
+  it would represent these with an empty list.  This better reflects the
+  original example proto and is consistent with TensorFlow Data Validation.
+* Coders now returns a `list` instead of an `ndarray` for a `VarLenFeature`.
+
+## Deprecations
+
+# Release 0.11.0
+
+## Major Features and Improvements
+
+## Bug Fixes and Other Changes
+* 'tft.vocabulary' and 'tft.compute_and_apply_vocabulary' now support filtering
+  based on mutual information when `labels` is provided.
+* Export all package level exports of `tensorflow_transform`, from the
+  `tensorflow_transform.beam` subpackage. This allows users to just import the
+  `tensorflow_transform.beam` subpackage for all functionality.
+* Adding API docs.
+* Fix bug where Transform returned a different dtype for a VarLenFeature with
+  0 elements.
+* Depends on `apache-beam[gcp]>=2.8,<3`.
+
+## Breaking changes
+* Requires pre-installed TensorFlow >=1.11,<2.
+
+## Deprecations
+* All functions in `tensorflow_transform.saved.input_fn_maker` are deprecated.
+  See the examples for how to construct the `input_fn` for training and serving.
+  Note that the examples demonstrate the use of the `tf.estimator` API.  The
+  functions named \*\_serving\_input\_fn were for use with the
+  `tf.contrib.estimator` API which is now deprecated.  We do not provide
+  examples of usage of the `tf.contrib.estimator` API, instead users should
+  upgrade to the `tf.estimator` API.
+
+# Release 0.9.0
+
+## Major Features and Improvements
+* Performance improvements for vocabulary generation when using top_k.
+* Utility to deep-copy Beam `PCollection`s was added to avoid unnecessary
+  materialization.
+* Utilize deep_copy to avoid unnecessary materialization of pcollections when
+  the input data is immutable. This feature is currently off by default and can
+  be enabled by setting `tft.Context.use_deep_copy_optimization=True`.
+* Add bucketize_per_key which computes separate quantiles for each key and then
+  bucketizes each value according to the quantiles computed for its key.
+* `tft.scale_to_z_score` is now implemented with a single pass over the data.
+* Export schema_utils package to convert from the `tensorflow-metadata` package
+  to the (soon to be deprecated) `tf_metadata` subpackage of
+  `tensorflow-transform`.
+
+## Bug Fixes and Other Changes
+* Memory reduction during vocabulary generation.
+* Clarify documentation on return values from `tft.compute_and_apply_vocabulary`
+  and `tft.string_to_int`.
+* `tft.unit` now explicitly creates Beam PCollections and validates the
+  transformed dataset by writing and then reading it from disk.
+* `tft.min`, `tft.size`, `tft.sum`, `tft.scale_to_z_score` and `tft.bucketize`
+  now support `tf.SparseTensor`.
+* Fix to `tft.scale_to_z_score` so it no longer attempts to divide by 0 when the
+  variance is 0.
+* Fix bug where internal graph analysis didn't handle the case where an
+  operation has control inputs that are operations (as opposed to tensors).
+* `tft.sparse_tensor_to_dense_with_shape` added which allows densifying a
+  `SparseTensor` while specifying the resulting `Tensor`'s shape.
+* Add `load_transform_graph` method to `TFTransformOutput` to load the transform
+  graph without applying it.  This has the effect of adding variables to the
+  checkpoint when calling it from the training `input_fn` when using
+  `tf.Estimator`.
+* 'tft.vocabulary' and 'tft.compute_and_apply_vocabulary' now accept an
+  optional `weights` argument. When `weights` is provided, weighted frequencies
+  are used instead of frequencies based on counts.
+* 'tft.quantiles' and 'tft.bucketize' now accept an optoinal `weights` argument.
+  When `weights` is provided, weighted count is used for quantiles instead of
+  the counts themselves.
+* Updated examples to construct the schema using
+  `dataset_schema.from_feature_spec`.
+* Updated the census example to allow the 'education-num' feature to be missing
+  and fill in a default value when it is.
+* Depends on `tensorflow-metadata>=0.9,<1`.
+* Depends on `apache-beam[gcp]>=2.6,<3`.
+
+## Breaking changes
+* We now validate a `Schema` in its constructor to make sure that it can be
+  converted to a feature spec.  In particular only `tf.int64`, `tf.string` and
+  `tf.float32` types are allowed.
+* We now disallow default values for `FixedColumnRepresentation`.
+* It is no longer possible to set a default value in the Schema, and validation
+  of shape parameters will occur earlier.
+* Removed Schema.as_batched_placeholders() method.
+* Removed all components of DatasetMetadata except the schema, and removed all
+  related classes and code.
+* Removed the merge method for DatasetMetadata and related classes.
+* read_metadata can now only read from a single metadata directory and
+  read_metadata and write_metadata no longer accept the `versions`  parameter.
+  They now only read/write the JSON format.
+* Requires pre-installed TensorFlow >=1.9,<2.
+
+## Deprecations
+* `apply_function` is no longer needed and is deprecated.
+  `apply_function(fn, *args)` is now equivalent to `fn(*args)`.  tf.Transform
+  is able to handle while loops and tables without the user wrapping the
+  function call in `apply_function`.
+
+# Release 0.8.0
 
 ## Major Features and Improvements
 * Add TFTransformOutput utility class that wraps the output of tf.Transform for
@@ -25,19 +233,16 @@
   e.g. `tft.coders.ExampleProtoCoder`.
 * Setting dtypes for numpy arrays in `tft.coders.ExampleProtoCoder` and
   `tft.coders.CsvCoder`.
-* tft.mean now supports SparseTensor when reduce_instance_dimensions=True.
-  In this case it returns a scalar mean computed over the non-missing values of
-  the SparseTensor.
-* tft.mean now supports SparseTensor when reduce_instance_dimensions=False.
-  In this case it returns a vector mean computed over the non-missing values of
-  the SparseTensor.
+* `tft.mean`, `tft.max` and `tft.var` now support `tf.SparseTensor`.
 * Update examples to use "core" TensorFlow estimator API (`tf.estimator`).
+* Depends on `protobuf>=3.6.0<4`.
 
 ## Breaking changes
 * `apply_saved_transform` is removed.  See note on
   `partially_apply_saved_transform` in the `Deprecations` section.
 * No longer set `vocabulary_file` in `IntDomain` when using
   `tft.compute_and_apply_vocabulary` or `tft.apply_vocabulary`.
+* Requires pre-installed TensorFlow >=1.8,<2.
 
 ## Deprecations
 * The `expected_asset_file_contents` of
@@ -49,10 +254,10 @@
   `TFTransformOutput.TRANSFORM_FN_DIR` respectively.
 * `partially_apply_saved_transform` is deprecated, users should use the
   `transform_raw_features` method of `TFTransformOuptut` instead.  These differ
-   in that `partially_apply_saved_transform` can also be used to return both the
-   input placeholders and the outputs.  But users do not need this functionality
-   because they will typically create the input placeholders themselves based
-   on the feature spec.
+  in that `partially_apply_saved_transform` can also be used to return both the
+  input placeholders and the outputs.  But users do not need this functionality
+  because they will typically create the input placeholders themselves based
+  on the feature spec.
 * Renamed `tft.uniques` to `tft.vocabulary`, `tft.string_to_int` to
   `tft.compute_and_apply_vocabulary` and `tft.apply_vocab` to
   `tft.apply_vocabulary`.  The existing methods will remain for a few more minor

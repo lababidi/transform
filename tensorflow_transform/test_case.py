@@ -13,13 +13,22 @@
 # limitations under the License.
 """Library for Tensorflow Transform test cases."""
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import inspect
 
+# GOOGLE-INITIALIZATION
 
 from absl.testing import parameterized
 
 import numpy as np
+import six
+import tensorflow as tf
 from tensorflow.python.framework import test_util
+
+main = tf.test.main
 
 named_parameters = parameterized.named_parameters
 
@@ -78,10 +87,11 @@ class TransformTestCase(parameterized.TestCase, test_util.TensorFlowTestCase):
     Raises:
       AssertionError: if the two datasets are not the same.
     """
+    a_data, b_data = self._sorted_data(a_data), self._sorted_data(b_data)
     self.assertEqual(
         len(a_data), len(b_data), 'len(%r) != len(%r)' % (a_data, b_data))
     for i, (a_row, b_row) in enumerate(zip(a_data, b_data)):
-      self.assertItemsEqual(a_row.keys(), b_row.keys(), msg='Row %d' % i)
+      self.assertCountEqual(a_row.keys(), b_row.keys(), msg='Row %d' % i)
       for key in a_row.keys():
         a_value = a_row[key]
         b_value = b_row[key]
@@ -94,8 +104,9 @@ class TransformTestCase(parameterized.TestCase, test_util.TensorFlowTestCase):
 
   def _assertValuesCloseOrEqual(self, a_value, b_value, msg=None):
     try:
-      if (isinstance(a_value, str) or isinstance(a_value, list) and a_value and
-          isinstance(a_value[0], str) or
+      if (isinstance(a_value, (six.binary_type, six.text_type)) or
+          isinstance(a_value, list) and a_value and
+          isinstance(a_value[0], (six.binary_type, six.text_type)) or
           isinstance(a_value, np.ndarray) and a_value.dtype == np.object):
         self.assertAllEqual(a_value, b_value)
       else:
@@ -104,3 +115,24 @@ class TransformTestCase(parameterized.TestCase, test_util.TensorFlowTestCase):
       if msg:
         e.args = ((e.args[0] + ' : ' + msg,) + e.args[1:])
       raise
+
+  def WriteRenderedDotFile(self, dot_string, output_file=None):
+    tf.logging.info('Writing a rendered dot file is not yet supported.')
+
+  def _numpy_arrays_to_lists(self, maybe_arrays):
+    return [
+        x.tolist() if isinstance(x, np.ndarray) else x for x in maybe_arrays]
+
+  def _sorted_dicts(self, list_of_dicts):
+    # Sorts dicts by their unordered (key, value) pairs.
+    return sorted(list_of_dicts, key=lambda d: sorted(d.items()))
+
+  def _sorted_data(self, list_of_dicts_of_arrays):
+    list_of_values = [
+        self._numpy_arrays_to_lists(d.values()) for d in list_of_dicts_of_arrays
+    ]
+    list_of_keys = [d.keys() for d in list_of_dicts_of_arrays]
+    unsorted_dict_list = [
+        dict(zip(a, b)) for a, b in zip(list_of_keys, list_of_values)
+    ]
+    return self._sorted_dicts(unsorted_dict_list)

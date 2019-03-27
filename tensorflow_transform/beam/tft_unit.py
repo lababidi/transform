@@ -13,19 +13,132 @@
 # limitations under the License.
 """Library for testing Tensorflow Transform."""
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 
+import os
+import tempfile
+
+# GOOGLE-INITIALIZATION
+
+import apache_beam as beam
+from builtins import zip  # pylint: disable=redefined-builtin
+
+import numpy as np
 import six
 import tensorflow as tf
 import tensorflow_transform as tft
-from tensorflow_transform import test_case
+
 from tensorflow_transform.beam import impl as beam_impl
 from tensorflow_transform.beam.tft_beam_io import transform_fn_io
+from tensorflow_transform import test_case
+from tensorflow_transform.beam import test_helpers
+from tensorflow_transform.tf_metadata import dataset_metadata
+from tensorflow_transform.tf_metadata import dataset_schema
 
 parameters = test_case.parameters
+named_parameters = test_case.named_parameters
+
+main = test_case.main
+
+
+# TODO(b/77351671): Remove this function once DatasetMetadata is replaced by a
+# schema proto.
+def metadata_from_feature_spec(feature_spec, domains=None):
+  """Construct a DatasetMetadata from a feature spec.
+
+  Args:
+    feature_spec: A feature spec
+    domains: A dict containing domains of features
+
+  Returns:
+    A `tft.tf_metadata.dataset_metadata.DatasetMetadata` object.
+  """
+  schema = dataset_schema.from_feature_spec(feature_spec, domains)
+  return dataset_metadata.DatasetMetadata(schema)
 
 
 class TransformTestCase(test_case.TransformTestCase):
   """Base test class for testing tf-transform preprocessing functions."""
+
+  def _makeTestPipeline(self):
+    return beam.Pipeline(**test_helpers.make_test_beam_pipeline_kwargs())
+
+  def assertAnalyzerOutputs(self,
+                            input_data,
+                            input_metadata,
+                            analyzer_fn,
+                            expected_outputs,
+                            desired_batch_size=None):
+    """Assert that input data and metadata is transformed as expected.
+
+    This methods asserts transformed data and transformed metadata match
+    with expected_data and expected_metadata.
+
+    Args:
+      input_data: A sequence of dicts whose values are either strings, lists of
+        strings, numeric types or a pair of those. Must have at least one key so
+        that we can infer the batch size.
+      input_metadata: DatasetMetadata describing input_data.
+      analyzer_fn: A function taking a dict of tensors and returning a dict of
+        tensors.  Unlike a preprocessing_fn, this should emit the results of a
+        call to an analyzer, while a preprocessing_fn must typically add a batch
+        dimension and broadcast across this batch dimension.
+      expected_outputs: A dict whose keys are the same as those of the output of
+        `analyzer_fn` and whose values are convertible to an ndarrays.
+      desired_batch_size: (Optional) A batch size to batch elements by. If not
+        provided, a batch size will be computed automatically.
+
+    Raises:
+      AssertionError: If the expected output does not match the results of
+          the analyzer_fn.
+    """
+
+    def preprocessing_fn(inputs):
+      """A helper function for validating analyzer outputs."""
+      # Get tensors representing the outputs of the analyzers
+      analyzer_outputs = analyzer_fn(inputs)
+
+      # Check that keys of analyzer_outputs match expected_output.
+      six.assertCountEqual(self, analyzer_outputs.keys(),
+                           expected_outputs.keys())
+
+      # Get batch size from any input tensor.
+      an_input = next(six.itervalues(inputs))
+      batch_size = tf.shape(an_input)[0]
+
+      # Add a batch dimension and broadcast the analyzer outputs.
+      result = {}
+      for key, output_tensor in six.iteritems(analyzer_outputs):
+        # Get the expected shape, and set it.
+        output_shape = list(expected_outputs[key].shape)
+        output_tensor.set_shape(output_shape)
+        # Add a batch dimension
+        output_tensor = tf.expand_dims(output_tensor, 0)
+        # Broadcast along the batch dimension
+        result[key] = tf.tile(
+            output_tensor, multiples=[batch_size] + [1] * len(output_shape))
+
+      return result
+
+    # Create test dataset by repeating the first instance a number of times.
+    num_test_instances = 3
+    test_data = [input_data[0]] * num_test_instances
+    expected_data = [expected_outputs] * num_test_instances
+    expected_metadata = metadata_from_feature_spec({
+        key: tf.FixedLenFeature(value.shape, tf.as_dtype(value.dtype))
+        for key, value in six.iteritems(expected_outputs)
+    })
+
+    self.assertAnalyzeAndTransformResults(
+        input_data,
+        input_metadata,
+        preprocessing_fn,
+        expected_data,
+        expected_metadata,
+        test_data=test_data,
+        desired_batch_size=desired_batch_size)
 
   def assertAnalyzeAndTransformResults(self,
                                        input_data,
@@ -33,11 +146,12 @@ class TransformTestCase(test_case.TransformTestCase):
                                        preprocessing_fn,
                                        expected_data=None,
                                        expected_metadata=None,
-                                       only_check_core_metadata=False,
                                        expected_vocab_file_contents=None,
                                        expected_asset_file_contents=None,
                                        test_data=None,
-                                       desired_batch_size=None):
+                                       desired_batch_size=None,
+                                       beam_pipeline=None,
+                                       temp_dir=None):
     """Assert that input data and metadata is transformed as expected.
 
     This methods asserts transformed data and transformed metadata match
@@ -54,13 +168,10 @@ class TransformTestCase(test_case.TransformTestCase):
           If supplied, transformed data is asserted to be equal.
       expected_metadata: (optional) DatasetMetadata describing the transformed
           data. If supplied, transformed metadata is asserted to be equal.
-      only_check_core_metadata: A boolean to indicate if all elements in
-          the transformed metadata is asserted to be equal to expected metadata.
-          If True, only transformed feature names, dtypes and representations
-          are asserted.
       expected_vocab_file_contents: (optional) A dictionary from vocab filenames
-          to their expected content as a list of text lines.  Values should be
-          the expected result of calling f.readlines() on the given asset files.
+          to their expected content as a list of text lines or a list of tuples
+          of frequency and text. Values should be the expected result of calling
+          f.readlines() on the given asset files.
       expected_asset_file_contents: deprecated.  Use
           expected_vocab_file_contents.
       test_data: (optional) If this is provided then instead of calling
@@ -70,6 +181,9 @@ class TransformTestCase(test_case.TransformTestCase):
           test_data should also conform to input_metadata.
       desired_batch_size: (optional) A batch size to batch elements by. If not
           provided, a batch size will be computed automatically.
+      beam_pipeline: (optional) A Beam Pipeline to use in this test.
+      temp_dir: If set, it is used as output directory, else a new unique
+          directory is created.
     Raises:
       AssertionError: if the expected data does not match the results of
           transforming input_data according to preprocessing_fn, or
@@ -93,57 +207,65 @@ class TransformTestCase(test_case.TransformTestCase):
     # AnalyzeAndTransformDataset currently simply composes these two
     # transforms.  If in future versions of the code, the implementation
     # differs, we should also run AnalyzeDataset and TransformDatset composed.
-    temp_dir = self.get_temp_dir()
-    with beam_impl.Context(
-        temp_dir=temp_dir, desired_batch_size=desired_batch_size):
-      if test_data is None:
-        (transformed_data, transformed_metadata), transform_fn = (
-            (input_data, input_metadata)
-            | beam_impl.AnalyzeAndTransformDataset(preprocessing_fn))
-      else:
-        transform_fn = ((input_data, input_metadata)
-                        | beam_impl.AnalyzeDataset(preprocessing_fn))
-        transformed_data, transformed_metadata = (
-            ((test_data, input_metadata), transform_fn)
-            | beam_impl.TransformDataset())
+    temp_dir = temp_dir or tempfile.mkdtemp(
+        prefix=self._testMethodName, dir=self.get_temp_dir())
+    with beam_pipeline or self._makeTestPipeline() as pipeline:
+      with beam_impl.Context(
+          temp_dir=temp_dir, desired_batch_size=desired_batch_size):
+        input_data = pipeline | 'CreateInput' >> beam.Create(input_data)
+        if test_data is None:
+          (transformed_data, transformed_metadata), transform_fn = (
+              (input_data, input_metadata)
+              | beam_impl.AnalyzeAndTransformDataset(preprocessing_fn))
+        else:
+          transform_fn = ((input_data, input_metadata)
+                          | beam_impl.AnalyzeDataset(preprocessing_fn))
+          test_data = pipeline | 'CreateTest' >> beam.Create(test_data)
+          transformed_data, transformed_metadata = (
+              ((test_data, input_metadata), transform_fn)
+              | beam_impl.TransformDataset())
 
-      # Write transform_fn so we can test its assets
-      if expected_vocab_file_contents:
+        # Write transform_fn so we can test its assets
         _ = transform_fn | transform_fn_io.WriteTransformFn(temp_dir)
 
+        if expected_data is not None:
+          transformed_data_coder = tft.coders.ExampleProtoCoder(
+              transformed_metadata.schema)
+
+          transformed_data_path = os.path.join(temp_dir, 'transformed_data')
+          _ = (
+              transformed_data
+              | beam.Map(transformed_data_coder.encode)
+              | beam.io.tfrecordio.WriteToTFRecord(
+                  transformed_data_path, shard_name_template=''))
+
+    # TODO(ebreck) Log transformed_data somewhere.
     if expected_data is not None:
+      examples = tf.python_io.tf_record_iterator(path=transformed_data_path)
+      transformed_data = [transformed_data_coder.decode(x) for x in examples]
       self.assertDataCloseOrEqual(expected_data, transformed_data)
 
-    if expected_metadata:
-      # Now that the pipeline has run, transformed_metadata.deferred_metadata
-      # should be a list containing a single DatasetMetadata with the full
-      # metadata.
-      assert len(transformed_metadata.deferred_metadata) == 1
-      transformed_metadata = transformed_metadata.deferred_metadata[0]
-
-      if only_check_core_metadata:
-        # preprocessing_fn may add metadata to column schema only relevant to
-        # internal implementation such as vocabulary_file. As such, only check
-        # feature names, dtypes and representations are as expected.
-        self.assertSameElements(
-            transformed_metadata.schema.column_schemas.keys(),
-            expected_metadata.schema.column_schemas.keys())
-        for k, v in transformed_metadata.schema.column_schemas.iteritems():
-          expected_schema = expected_metadata.schema.column_schemas[k]
-          self.assertEqual(expected_schema.representation, v.representation,
-                           "representation doesn't match for feature '%s'" % k)
-          self.assertEqual(expected_schema.domain.dtype, v.domain.dtype,
-                           "dtype doesn't match for feature '%s'" % k)
-      else:
-        # Check the entire DatasetMetadata is as expected.
-        # Use extra assertEqual for schemas, since full metadata assertEqual
-        # error message is not conducive to debugging.
-        self.assertEqual(expected_metadata.schema.column_schemas,
-                         transformed_metadata.schema.column_schemas)
-        self.assertEqual(expected_metadata, transformed_metadata)
-
     tf_transform_output = tft.TFTransformOutput(temp_dir)
+    if expected_metadata:
+      self.assertEqual(expected_metadata,
+                       tf_transform_output.transformed_metadata)
+
     for filename, file_contents in six.iteritems(expected_vocab_file_contents):
       full_filename = tf_transform_output.vocabulary_file_by_name(filename)
-      with tf.gfile.Open(full_filename) as f:
-        self.assertEqual(f.readlines(), file_contents)
+      with tf.gfile.Open(full_filename, 'rb') as f:
+        file_lines = f.readlines()
+
+        # Store frequency case.
+        if isinstance(file_contents[0], tuple):
+          word_and_frequency_list = []
+          for content in file_lines:
+            frequency, word = content.split(b' ', 1)
+            word_and_frequency_list.append((word.strip(b'\n'),
+                                            float(frequency.strip(b'\n'))))
+          expected_words, expected_frequency = zip(*word_and_frequency_list)
+          actual_words, actual_frequency = zip(*file_contents)
+          self.assertAllEqual(expected_words, actual_words)
+          np.testing.assert_almost_equal(expected_frequency, actual_frequency)
+        else:
+          file_lines = [content.strip(b'\n') for content in file_lines]
+          self.assertAllEqual(file_lines, file_contents)
