@@ -149,9 +149,8 @@ def reduce_batch_count(x, reduce_instance_dims):
   if reduce_instance_dims:
     return tf.size(x)
 
-  # Fill a tensor shaped like x except batch_size=1 with batch_size.
-  x_shape = tf.shape(x)
-  return tf.fill(x_shape[1:], x_shape[0])
+  # Count the non-nan values along the batch dim axis, and return a tensor shaped like x
+  return tf.reduce_sum(tf.where(tf.is_nan(x), tf.zeros_like(x), tf.ones_like(x)), axis=0)
 
 
 def reduce_batch_count_mean_and_var(x, reduce_instance_dims):
@@ -175,6 +174,10 @@ def reduce_batch_count_mean_and_var(x, reduce_instance_dims):
   reduce_sum_fn = (
       tf.sparse_reduce_sum if isinstance(x, tf.SparseTensor) else tf.reduce_sum)
   axis = None if reduce_instance_dims else 0
+
+  # If we have a dense tensor with nans, do not include in the sum
+  if not isinstance(x, tf.SparseTensor):
+    x = tf.where(tf.is_nan(x), tf.zeros_like(x), x)
 
   x_mean = reduce_sum_fn(x, axis=axis) / x_count
 
