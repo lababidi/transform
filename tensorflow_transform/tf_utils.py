@@ -314,7 +314,7 @@ def reduce_batch_count(x, reduce_instance_dims):
           dense_shape=x.dense_shape)
       return tf.sparse.reduce_sum(ones_like, axis=0)
 
-  ones_like = tf.where(tf.math.is_nan(tf.cast(x, tf.float64)), 0.0, 1.0)
+  ones_like = tf.where(tf.math.is_nan(tf.cast(x, tf.float64)), tf.zeros_like(x), tf.ones_like(x))
 
   if reduce_instance_dims:
     return tf.reduce_sum(ones_like)
@@ -630,8 +630,8 @@ def reduce_batch_count_mean_and_var(x, reduce_instance_dims):
 
   else:
     include = tf.math.logical_not(tf.math.is_nan(x))
-    x_mean = tf.reduce_sum(tf.where(include, x, 0.0), axis=axis) / x_count
-    x_minus_mean = tf.where(include, x - x_mean, 0.0)
+    x_mean = tf.reduce_sum(tf.where(include, x, tf.zeros_like(x)), axis=axis) / x_count
+    x_minus_mean = tf.where(include, x - x_mean, tf.zeros_like(x))
     x_variance = tf.reduce_sum(
         input_tensor=tf.square(x_minus_mean), axis=axis) / x_count
 
