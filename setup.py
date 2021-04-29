@@ -35,7 +35,7 @@ def _make_required_install_packages():
       'six>=1.12,<2',
       'tensorflow-metadata>=0.23,<0.24',
       'tensorflow>=1.15.2,!=2.0.*,!=2.1.*,!=2.2.*,<2.4',
-      'tfx-bsl>=0.23,<0.24',
+      'tfx-bsl>=0.23,<0.25',
   ]
 
 # Get the long description from the README file.
